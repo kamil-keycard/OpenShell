@@ -2019,7 +2019,26 @@ pub async fn sandbox_create(
     };
     let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
 
-    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
+    let parsed_secrets: HashMap<String, String> = secrets
+        .iter()
+        .filter_map(|s| {
+            let (key, value) = s.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect();
+
+    let inferred_types: Vec<String> = {
+        let secret_keys: HashSet<&str> = parsed_secrets.keys().map(String::as_str).collect();
+        let registry = ProviderRegistry::new();
+        inferred_provider_type(command)
+            .into_iter()
+            .filter(|t| {
+                let cred_vars = registry.credential_env_vars(t);
+                !cred_vars.iter().any(|v| secret_keys.contains(*v))
+            })
+            .collect()
+    };
+
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,
@@ -2034,14 +2053,6 @@ pub async fn sandbox_create(
         image: img,
         ..SandboxTemplate::default()
     });
-
-    let parsed_secrets: HashMap<String, String> = secrets
-        .iter()
-        .filter_map(|s| {
-            let (key, value) = s.split_once('=')?;
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect();
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
@@ -5038,6 +5049,8 @@ mod tests {
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
     use openshell_bootstrap::{load_active_gateway, store_gateway_metadata};
+    use openshell_providers::ProviderRegistry;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -5229,6 +5242,47 @@ mod tests {
     fn inferred_provider_type_handles_full_path() {
         let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
         assert_eq!(result, Some("claude".to_string()));
+    }
+
+    /// Helper that replicates the secret-key filtering applied to inferred
+    /// provider types in `sandbox_create`.
+    fn filter_inferred_types(command: &[String], secret_keys: &HashSet<&str>) -> Vec<String> {
+        let registry = ProviderRegistry::new();
+        inferred_provider_type(command)
+            .into_iter()
+            .filter(|t| {
+                let cred_vars = registry.credential_env_vars(t);
+                !cred_vars.iter().any(|v| secret_keys.contains(*v))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inferred_type_skipped_when_secret_covers_primary_credential() {
+        let keys: HashSet<&str> = ["ANTHROPIC_API_KEY"].into();
+        let result = filter_inferred_types(&["claude".to_string()], &keys);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn inferred_type_skipped_when_secret_covers_alternate_credential() {
+        let keys: HashSet<&str> = ["CLAUDE_API_KEY"].into();
+        let result = filter_inferred_types(&["claude".to_string()], &keys);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn inferred_type_kept_when_secret_is_unrelated() {
+        let keys: HashSet<&str> = ["OPENAI_API_KEY"].into();
+        let result = filter_inferred_types(&["claude".to_string()], &keys);
+        assert_eq!(result, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn inferred_type_kept_when_no_secrets() {
+        let keys: HashSet<&str> = HashSet::new();
+        let result = filter_inferred_types(&["claude".to_string()], &keys);
+        assert_eq!(result, vec!["claude".to_string()]);
     }
 
     #[test]
