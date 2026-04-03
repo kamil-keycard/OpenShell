@@ -5,6 +5,7 @@
 
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
+use crate::keycard::{KeycardClient, KeycardConfig, SandboxKeycardCredentials};
 use crate::persistence::{
     DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store, generate_name,
 };
@@ -187,10 +188,12 @@ impl OpenShell for OpenShellService {
         // Validate field sizes before any I/O (fail fast on oversized payloads).
         validate_sandbox_spec(&request.name, &spec)?;
 
-        // Validate provider names exist (fail fast). Credentials are fetched at
-        // runtime by the sandbox supervisor via GetSandboxProviderEnvironment.
+        // Validate provider names exist (fail fast) and collect keycard providers
+        // for lifecycle provisioning after sandbox ID is generated.
+        let mut keycard_providers: Vec<(String, Provider)> = Vec::new();
         for name in &spec.providers {
-            self.state
+            let provider = self
+                .state
                 .store
                 .get_message_by_name::<Provider>(name)
                 .await
@@ -198,6 +201,10 @@ impl OpenShell for OpenShellService {
                 .ok_or_else(|| {
                     Status::failed_precondition(format!("provider '{name}' not found"))
                 })?;
+
+            if provider.r#type == openshell_providers::providers::keycard::PROVIDER_TYPE {
+                keycard_providers.push((name.clone(), provider));
+            }
         }
 
         // Ensure the template always carries the resolved image so clients
@@ -233,6 +240,57 @@ impl OpenShell for OpenShellService {
             request.name.clone()
         };
         let namespace = self.state.config.sandbox_namespace.clone();
+
+        // Provision Keycard applications for any keycard providers.
+        // This must happen before K8s resource creation so credentials are
+        // available when the sandbox supervisor boots. If provisioning fails,
+        // sandbox creation is aborted entirely.
+        for (provider_name, provider) in &keycard_providers {
+            let kc_config = KeycardConfig::from_provider_config(&provider.config).ok_or_else(
+                || {
+                    Status::failed_precondition(format!(
+                        "keycard provider '{provider_name}' missing required config keys (base_url, zone_id, client_id, client_secret)"
+                    ))
+                },
+            )?;
+
+            let client = KeycardClient::new(kc_config).map_err(|e| {
+                Status::internal(format!(
+                    "failed to create keycard client for provider '{provider_name}': {e}"
+                ))
+            })?;
+
+            let provisioned = client.provision_sandbox(&id).await.map_err(|e| {
+                warn!(
+                    sandbox_id = %id,
+                    provider_name = %provider_name,
+                    error = %e,
+                    "Keycard provisioning failed, aborting sandbox creation"
+                );
+                Status::unavailable(format!(
+                    "keycard provisioning failed for provider '{provider_name}': {e}"
+                ))
+            })?;
+
+            self.state
+                .keycard_credentials
+                .insert(
+                    id.clone(),
+                    SandboxKeycardCredentials {
+                        application_id: provisioned.application_id,
+                        provider_name: provider_name.clone(),
+                        client_id: provisioned.client_id,
+                        client_secret: provisioned.client_secret,
+                    },
+                )
+                .await;
+
+            info!(
+                sandbox_id = %id,
+                provider_name = %provider_name,
+                "Keycard application provisioned for sandbox"
+            );
+        }
 
         let sandbox = Sandbox {
             id: id.clone(),
@@ -272,13 +330,13 @@ impl OpenShell for OpenShellService {
             .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
 
         // Now create the Kubernetes resource.  If this fails, clean up
-        // the store entry to avoid orphans.
+        // the store entry and Keycard credentials to avoid orphans.
         match self.state.sandbox_client.create(&sandbox).await {
             Ok(_) => {}
             Err(kube::Error::Api(err)) if err.code == 409 => {
-                // Clean up the store entry we just wrote.
                 let _ = self.state.store.delete("sandbox", &id).await;
                 self.state.sandbox_index.remove_sandbox(&id);
+                self.state.keycard_credentials.remove(&id).await;
                 warn!(
                     sandbox_id = %id,
                     sandbox_name = %name,
@@ -287,9 +345,9 @@ impl OpenShell for OpenShellService {
                 return Err(Status::already_exists("sandbox already exists"));
             }
             Err(err) => {
-                // Clean up the store entry we just wrote.
                 let _ = self.state.store.delete("sandbox", &id).await;
                 self.state.sandbox_index.remove_sandbox(&id);
+                self.state.keycard_credentials.remove(&id).await;
                 warn!(
                     sandbox_id = %id,
                     sandbox_name = %name,
@@ -655,6 +713,53 @@ impl OpenShell for OpenShellService {
             }
         }
 
+        // Clean up Keycard APPLICATION if this sandbox has one.
+        if let Some(kc_creds) = self.state.keycard_credentials.remove(&id).await {
+            let spec = sandbox.spec.as_ref();
+            let provider = if let Some(spec) = spec {
+                let mut found = None;
+                for pname in &spec.providers {
+                    if *pname == kc_creds.provider_name {
+                        found = self.state.store.get_message_by_name::<Provider>(pname).await.ok().flatten();
+                        break;
+                    }
+                }
+                found
+            } else {
+                None
+            };
+
+            if let Some(provider) = provider {
+                if let Some(kc_config) = KeycardConfig::from_provider_config(&provider.config) {
+                    match KeycardClient::new(kc_config) {
+                        Ok(client) => {
+                            if let Err(e) = client.delete_application(&kc_creds.application_id).await {
+                                warn!(
+                                    sandbox_id = %id,
+                                    application_id = %kc_creds.application_id,
+                                    error = %e,
+                                    "Failed to delete Keycard application during sandbox cleanup"
+                                );
+                            } else {
+                                info!(
+                                    sandbox_id = %id,
+                                    application_id = %kc_creds.application_id,
+                                    "Keycard application deleted during sandbox cleanup"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                sandbox_id = %id,
+                                error = %e,
+                                "Failed to create Keycard client for cleanup"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Clean up sandbox-scoped settings record.
         if let Err(e) = self
             .state
@@ -929,8 +1034,13 @@ impl OpenShell for OpenShellService {
             .spec
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-        let environment =
-            resolve_provider_environment(self.state.store.as_ref(), &spec.providers).await?;
+        let environment = resolve_provider_environment(
+            self.state.store.as_ref(),
+            &spec.providers,
+            &self.state.keycard_credentials,
+            &sandbox_id,
+        )
+        .await?;
 
         info!(
             sandbox_id = %sandbox_id,
@@ -3638,9 +3748,16 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String>
 /// collects credential key-value pairs. Returns a map of environment variables
 /// to inject into the sandbox. When duplicate keys appear across providers, the
 /// first provider's value wins.
+///
+/// For Keycard providers, admin credentials from the provider record are NEVER
+/// injected. Instead, per-sandbox ephemeral credentials are read from the
+/// `KeycardCredentialStore` and injected as `KEYCARD_CLIENT_ID` and
+/// `KEYCARD_CLIENT_SECRET`.
 async fn resolve_provider_environment(
     store: &crate::persistence::Store,
     provider_names: &[String],
+    keycard_store: &crate::keycard::KeycardCredentialStore,
+    sandbox_id: &str,
 ) -> Result<std::collections::HashMap<String, String>, Status> {
     if provider_names.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -3654,6 +3771,28 @@ async fn resolve_provider_environment(
             .await
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+
+        if provider.r#type == openshell_providers::providers::keycard::PROVIDER_TYPE {
+            // Keycard providers: inject per-sandbox ephemeral credentials only.
+            // Admin credentials in the provider record MUST NOT leak into the sandbox.
+            if let Some(kc_creds) = keycard_store.get(sandbox_id).await {
+                env.entry(
+                    openshell_providers::providers::keycard::ENV_KEYCARD_CLIENT_ID.to_string(),
+                )
+                .or_insert_with(|| kc_creds.client_id.clone());
+                env.entry(
+                    openshell_providers::providers::keycard::ENV_KEYCARD_CLIENT_SECRET.to_string(),
+                )
+                .or_insert_with(|| kc_creds.client_secret.clone());
+            } else {
+                warn!(
+                    provider_name = %name,
+                    sandbox_id = %sandbox_id,
+                    "no keycard credentials found for sandbox"
+                );
+            }
+            continue;
+        }
 
         for (key, value) in &provider.credentials {
             if is_valid_env_key(key) {
@@ -4123,7 +4262,23 @@ async fn create_provider_record(
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
-    if provider.credentials.is_empty() {
+
+    let is_keycard =
+        provider.r#type.trim() == openshell_providers::providers::keycard::PROVIDER_TYPE;
+
+    if is_keycard {
+        // Keycard providers keep admin credentials in config, not credentials.
+        // Validate required config keys are present.
+        for key in openshell_providers::providers::keycard::REQUIRED_CONFIG_KEYS {
+            if !provider.config.contains_key(*key)
+                || provider.config[*key].trim().is_empty()
+            {
+                return Err(Status::invalid_argument(format!(
+                    "keycard provider requires config key '{key}'"
+                )));
+            }
+        }
+    } else if provider.credentials.is_empty() {
         return Err(Status::invalid_argument(
             "provider.credentials must not be empty",
         ));
@@ -4297,6 +4452,7 @@ mod tests {
         merge_chunk_into_policy, reject_control_chars, resolve_provider_environment, shell_escape,
         update_provider_record, validate_provider_fields, validate_sandbox_spec,
     };
+    use crate::keycard::KeycardCredentialStore;
     use crate::persistence::{DraftChunkRecord, Store};
     use openshell_core::proto::{Provider, SandboxSpec, SandboxTemplate};
     use prost::Message;
@@ -4847,7 +5003,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
-        let result = resolve_provider_environment(&store, &[]).await.unwrap();
+        let kc = KeycardCredentialStore::new();
+        let result = resolve_provider_environment(&store, &[], &kc, "test").await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -4872,7 +5029,8 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["claude-local".to_string()])
+        let kc = KeycardCredentialStore::new();
+        let result = resolve_provider_environment(&store, &["claude-local".to_string()], &kc, "test")
             .await
             .unwrap();
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
@@ -4884,7 +5042,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_unknown_name_returns_error() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
-        let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
+        let kc = KeycardCredentialStore::new();
+        let err = resolve_provider_environment(&store, &["nonexistent".to_string()], &kc, "test")
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
@@ -4909,7 +5068,8 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["test-provider".to_string()])
+        let kc = KeycardCredentialStore::new();
+        let result = resolve_provider_environment(&store, &["test-provider".to_string()], &kc, "test")
             .await
             .unwrap();
         assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
@@ -4950,9 +5110,12 @@ mod tests {
         .await
         .unwrap();
 
+        let kc = KeycardCredentialStore::new();
         let result = resolve_provider_environment(
             &store,
             &["claude-local".to_string(), "gitlab-local".to_string()],
+            &kc,
+            "test",
         )
         .await
         .unwrap();
@@ -4993,9 +5156,12 @@ mod tests {
         .await
         .unwrap();
 
+        let kc = KeycardCredentialStore::new();
         let result = resolve_provider_environment(
             &store,
             &["provider-a".to_string(), "provider-b".to_string()],
+            &kc,
+            "test",
         )
         .await
         .unwrap();
@@ -5050,7 +5216,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let kc = KeycardCredentialStore::new();
+        let env = resolve_provider_environment(&store, &spec.providers, &kc, "sandbox-001")
             .await
             .unwrap();
 
@@ -5081,7 +5248,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let kc = KeycardCredentialStore::new();
+        let env = resolve_provider_environment(&store, &spec.providers, &kc, "sandbox-002")
             .await
             .unwrap();
 
