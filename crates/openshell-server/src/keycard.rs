@@ -441,4 +441,174 @@ mod tests {
         assert_ne!(a.client_id, b.client_id);
         assert_ne!(a.client_secret, b.client_secret);
     }
+
+    // ---- Wiremock-based Keycard HTTP client tests ----
+
+    mod wiremock_tests {
+        use super::*;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn test_config(base_url: &str) -> KeycardConfig {
+            KeycardConfig {
+                base_url: base_url.to_string(),
+                zone_id: "zone-test".to_string(),
+                admin_client_id: "admin-id".to_string(),
+                admin_client_secret: "admin-secret".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn provision_sandbox_success() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/zones/zone-test/applications"))
+                .and(header("content-type", "application/json"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "internal-app-id",
+                    "publicId": "public-app-id"
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/zones/zone-test/application-credentials"))
+                .and(header("content-type", "application/json"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "identifier": "sandbox-client-id",
+                    "password": "sandbox-client-secret"
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let result = client.provision_sandbox("sandbox-001").await.unwrap();
+
+            assert_eq!(result.application_id, "internal-app-id");
+            assert_eq!(result.public_id, "public-app-id");
+            assert_eq!(result.client_id, "sandbox-client-id");
+            assert_eq!(result.client_secret, "sandbox-client-secret");
+        }
+
+        #[tokio::test]
+        async fn provision_sandbox_app_creation_failure() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/zones/zone-test/applications"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let err = client.provision_sandbox("sandbox-fail").await.unwrap_err();
+
+            match err {
+                KeycardError::Api { status, body } => {
+                    assert_eq!(status, 500);
+                    assert!(body.contains("internal error"));
+                }
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn provision_sandbox_credential_failure_cleans_up_app() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/zones/zone-test/applications"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "app-to-cleanup",
+                    "publicId": "public-cleanup"
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/zones/zone-test/application-credentials"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("cred error"))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            // The cleanup call should try to delete the application.
+            Mock::given(method("DELETE"))
+                .and(path("/zones/zone-test/applications/app-to-cleanup"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let err = client.provision_sandbox("sandbox-cred-fail").await.unwrap_err();
+
+            match err {
+                KeycardError::Api { status, .. } => assert_eq!(status, 500),
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_application_success() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("DELETE"))
+                .and(path("/zones/zone-test/applications/app-123"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            client.delete_application("app-123").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn delete_application_not_found_is_ok() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("DELETE"))
+                .and(path("/zones/zone-test/applications/gone"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            // 404 should not be an error (idempotent delete).
+            client.delete_application("gone").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn delete_application_server_error() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("DELETE"))
+                .and(path("/zones/zone-test/applications/app-err"))
+                .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let err = client.delete_application("app-err").await.unwrap_err();
+
+            match err {
+                KeycardError::Api { status, .. } => assert_eq!(status, 503),
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+    }
 }

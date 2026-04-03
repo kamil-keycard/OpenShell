@@ -5266,6 +5266,262 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // ---- Keycard provider tests ----
+
+    fn keycard_config_map() -> HashMap<String, String> {
+        [
+            ("base_url".to_string(), "https://keycard.example.com".to_string()),
+            ("zone_id".to_string(), "zone-001".to_string()),
+            ("client_id".to_string(), "admin-id".to_string()),
+            ("client_secret".to_string(), "admin-secret".to_string()),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn create_keycard_provider_without_credentials_succeeds() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let provider = Provider {
+            id: String::new(),
+            name: "my-keycard".to_string(),
+            r#type: "keycard".to_string(),
+            credentials: HashMap::new(),
+            config: keycard_config_map(),
+        };
+        let result = create_provider_record(&store, provider).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_keycard_provider_missing_config_fails() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let provider = Provider {
+            id: String::new(),
+            name: "bad-keycard".to_string(),
+            r#type: "keycard".to_string(),
+            credentials: HashMap::new(),
+            config: [("base_url".to_string(), "https://kc.example.com".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let err = create_provider_record(&store, provider).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("zone_id"));
+    }
+
+    #[tokio::test]
+    async fn create_keycard_provider_empty_config_value_fails() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let mut config = keycard_config_map();
+        config.insert("zone_id".to_string(), "  ".to_string());
+        let provider = Provider {
+            id: String::new(),
+            name: "bad-keycard".to_string(),
+            r#type: "keycard".to_string(),
+            credentials: HashMap::new(),
+            config,
+        };
+        let err = create_provider_record(&store, provider).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("zone_id"));
+    }
+
+    #[tokio::test]
+    async fn resolve_keycard_provider_injects_sandbox_credentials() {
+        use crate::keycard::SandboxKeycardCredentials;
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let provider = Provider {
+            id: String::new(),
+            name: "my-keycard".to_string(),
+            r#type: "keycard".to_string(),
+            credentials: HashMap::new(),
+            config: keycard_config_map(),
+        };
+        create_provider_record(&store, provider).await.unwrap();
+
+        let kc = KeycardCredentialStore::new();
+        kc.insert(
+            "sandbox-abc".to_string(),
+            SandboxKeycardCredentials {
+                application_id: "app-123".to_string(),
+                provider_name: "my-keycard".to_string(),
+                client_id: "sandbox-client-id".to_string(),
+                client_secret: "sandbox-client-secret".to_string(),
+            },
+        )
+        .await;
+
+        let result = resolve_provider_environment(
+            &store,
+            &["my-keycard".to_string()],
+            &kc,
+            "sandbox-abc",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.get("KEYCARD_CLIENT_ID"),
+            Some(&"sandbox-client-id".to_string())
+        );
+        assert_eq!(
+            result.get("KEYCARD_CLIENT_SECRET"),
+            Some(&"sandbox-client-secret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_keycard_provider_never_leaks_admin_credentials() {
+        use crate::keycard::SandboxKeycardCredentials;
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        // Create a keycard provider that also has something in credentials map
+        // (should never happen via create_provider_record, but test defense-in-depth).
+        let provider = Provider {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "sneaky-keycard".to_string(),
+            r#type: "keycard".to_string(),
+            credentials: [("ADMIN_SECRET".to_string(), "should-not-appear".to_string())]
+                .into_iter()
+                .collect(),
+            config: keycard_config_map(),
+        };
+        store.put_message(&provider).await.unwrap();
+
+        let kc = KeycardCredentialStore::new();
+        kc.insert(
+            "sandbox-xyz".to_string(),
+            SandboxKeycardCredentials {
+                application_id: "app-456".to_string(),
+                provider_name: "sneaky-keycard".to_string(),
+                client_id: "safe-id".to_string(),
+                client_secret: "safe-secret".to_string(),
+            },
+        )
+        .await;
+
+        let result = resolve_provider_environment(
+            &store,
+            &["sneaky-keycard".to_string()],
+            &kc,
+            "sandbox-xyz",
+        )
+        .await
+        .unwrap();
+
+        // Admin credentials MUST NOT appear.
+        assert!(!result.contains_key("ADMIN_SECRET"));
+        assert!(!result.values().any(|v| v == "should-not-appear"));
+
+        // Sandbox credentials should be present.
+        assert_eq!(result.get("KEYCARD_CLIENT_ID"), Some(&"safe-id".to_string()));
+        assert_eq!(
+            result.get("KEYCARD_CLIENT_SECRET"),
+            Some(&"safe-secret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_keycard_provider_without_sandbox_credentials_warns() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let provider = Provider {
+            id: String::new(),
+            name: "orphan-keycard".to_string(),
+            r#type: "keycard".to_string(),
+            credentials: HashMap::new(),
+            config: keycard_config_map(),
+        };
+        create_provider_record(&store, provider).await.unwrap();
+
+        let kc = KeycardCredentialStore::new();
+        let result = resolve_provider_environment(
+            &store,
+            &["orphan-keycard".to_string()],
+            &kc,
+            "sandbox-no-creds",
+        )
+        .await
+        .unwrap();
+
+        // No keycard credentials stored → empty result.
+        assert!(!result.contains_key("KEYCARD_CLIENT_ID"));
+        assert!(!result.contains_key("KEYCARD_CLIENT_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn resolve_mixed_providers_keycard_and_regular() {
+        use crate::keycard::SandboxKeycardCredentials;
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "my-claude".to_string(),
+                r#type: "claude".to_string(),
+                credentials: std::iter::once((
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-abc".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "my-keycard".to_string(),
+                r#type: "keycard".to_string(),
+                credentials: HashMap::new(),
+                config: keycard_config_map(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let kc = KeycardCredentialStore::new();
+        kc.insert(
+            "sandbox-mix".to_string(),
+            SandboxKeycardCredentials {
+                application_id: "app-mix".to_string(),
+                provider_name: "my-keycard".to_string(),
+                client_id: "kc-id".to_string(),
+                client_secret: "kc-secret".to_string(),
+            },
+        )
+        .await;
+
+        let result = resolve_provider_environment(
+            &store,
+            &["my-claude".to_string(), "my-keycard".to_string()],
+            &kc,
+            "sandbox-mix",
+        )
+        .await
+        .unwrap();
+
+        // Regular provider credentials.
+        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
+        // Keycard sandbox credentials.
+        assert_eq!(result.get("KEYCARD_CLIENT_ID"), Some(&"kc-id".to_string()));
+        assert_eq!(
+            result.get("KEYCARD_CLIENT_SECRET"),
+            Some(&"kc-secret".to_string())
+        );
+        // No admin keycard credentials.
+        assert!(!result.contains_key("base_url"));
+        assert!(!result.contains_key("zone_id"));
+        assert!(!result.contains_key("client_id"));
+        assert!(!result.contains_key("client_secret"));
+    }
+
     // ---- Policy safety validation tests ----
 
     #[test]
