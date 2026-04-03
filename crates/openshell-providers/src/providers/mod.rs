@@ -8,6 +8,7 @@ pub mod copilot;
 pub mod generic;
 pub mod github;
 pub mod gitlab;
+pub mod keycard;
 pub mod nvidia;
 pub mod openai;
 pub mod opencode;
