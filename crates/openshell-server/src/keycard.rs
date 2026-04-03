@@ -85,6 +85,9 @@ impl KeycardConfig {
 pub struct KeycardClient {
     http: reqwest::Client,
     config: KeycardConfig,
+    /// Override the token exchange base URL (for testing with wiremock).
+    /// When `None`, uses `https://{zone_id}.keycard.cloud`.
+    exchange_base_url: Option<String>,
 }
 
 /// Result of provisioning a Keycard application for a sandbox.
@@ -120,7 +123,20 @@ impl KeycardClient {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            exchange_base_url: None,
+        })
+    }
+
+    /// Build the base URL for the per-sandbox OAuth2 token exchange endpoint.
+    fn token_exchange_base_url(&self) -> String {
+        if let Some(ref url) = self.exchange_base_url {
+            url.clone()
+        } else {
+            format!("https://{}.keycard.cloud", self.config.zone_id)
+        }
     }
 
     /// Build the SPIFFE ID for a sandbox application.
@@ -236,10 +252,7 @@ impl KeycardClient {
         client_secret: &str,
         resource_urn: &str,
     ) -> Result<String, KeycardError> {
-        let url = format!(
-            "https://{}.keycard.cloud/oauth/2/token",
-            self.config.zone_id
-        );
+        let url = format!("{}/oauth/2/token", self.token_exchange_base_url());
 
         let response = self
             .http
@@ -831,6 +844,89 @@ mod tests {
 
             match err {
                 KeycardError::Api { status, .. } => assert_eq!(status, 503),
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+
+        fn test_client_with_exchange(base_url: &str, exchange_url: &str) -> KeycardClient {
+            let config = test_config(base_url);
+            let mut client = KeycardClient::new(config).unwrap();
+            client.exchange_base_url = Some(exchange_url.to_string());
+            client
+        }
+
+        #[tokio::test]
+        async fn exchange_token_success() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/oauth/2/token"))
+                .and(header("content-type", "application/x-www-form-urlencoded"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "sk-ant-actual-api-key",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                })))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let client = test_client_with_exchange(&mock_server.uri(), &mock_server.uri());
+            let token = client
+                .exchange_token("sb-client-id", "sb-client-secret", "urn:resource:anthropic-api-key")
+                .await
+                .unwrap();
+
+            assert_eq!(token, "sk-ant-actual-api-key");
+        }
+
+        #[tokio::test]
+        async fn exchange_token_auth_failure() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/oauth/2/token"))
+                .respond_with(
+                    ResponseTemplate::new(401).set_body_string("invalid client credentials"),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let client = test_client_with_exchange(&mock_server.uri(), &mock_server.uri());
+            let err = client
+                .exchange_token("bad-id", "bad-secret", "urn:resource:test")
+                .await
+                .unwrap_err();
+
+            match err {
+                KeycardError::Api { status, body } => {
+                    assert_eq!(status, 401);
+                    assert!(body.contains("invalid client credentials"));
+                }
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn exchange_token_server_error() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/oauth/2/token"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let client = test_client_with_exchange(&mock_server.uri(), &mock_server.uri());
+            let err = client
+                .exchange_token("id", "secret", "urn:resource:test")
+                .await
+                .unwrap_err();
+
+            match err {
+                KeycardError::Api { status, .. } => assert_eq!(status, 500),
                 other => panic!("expected Api error, got: {other}"),
             }
         }

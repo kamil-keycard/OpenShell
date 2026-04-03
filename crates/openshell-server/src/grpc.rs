@@ -261,6 +261,7 @@ impl OpenShell for OpenShellService {
                 },
             )?;
 
+            let zone_id = kc_config.zone_id.clone();
             let client = KeycardClient::new(kc_config).map_err(|e| {
                 Status::internal(format!(
                     "failed to create keycard client for provider '{provider_name}': {e}"
@@ -288,7 +289,7 @@ impl OpenShell for OpenShellService {
                         provider_name: provider_name.clone(),
                         client_id: provisioned.client_id,
                         client_secret: provisioned.client_secret,
-                        zone_id: kc_config.zone_id.clone(),
+                        zone_id,
                     },
                 )
                 .await;
@@ -6373,6 +6374,50 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_sandbox_spec("my-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_valid_secrets() {
+        let spec = SandboxSpec {
+            secrets: [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "urn:resource:anthropic-api-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("ok", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_secrets_key() {
+        let spec = SandboxSpec {
+            secrets: [(
+                "bad-key".to_string(),
+                "urn:resource:test".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("bad-key"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_too_many_secrets() {
+        let secrets: HashMap<String, String> = (0..=MAX_ENVIRONMENT_ENTRIES)
+            .map(|i| (format!("K{i}"), "urn:resource:test".to_string()))
+            .collect();
+        let spec = SandboxSpec {
+            secrets,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("secrets"));
     }
 
     // ---- Provider field limit tests ----

@@ -2035,7 +2035,7 @@ pub async fn sandbox_create(
         ..SandboxTemplate::default()
     });
 
-    let parsed_secrets: std::collections::HashMap<String, String> = secrets
+    let parsed_secrets: HashMap<String, String> = secrets
         .iter()
         .filter_map(|s| {
             let (key, value) = s.split_once('=')?;
