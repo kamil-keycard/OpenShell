@@ -604,6 +604,7 @@ enum CliProviderType {
     Nvidia,
     Gitlab,
     Github,
+    Keycard,
     Outlook,
 }
 
@@ -635,6 +636,7 @@ impl CliProviderType {
             Self::Nvidia => "nvidia",
             Self::Gitlab => "gitlab",
             Self::Github => "github",
+            Self::Keycard => "keycard",
             Self::Outlook => "outlook",
         }
     }
@@ -643,7 +645,7 @@ impl CliProviderType {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").args(["from_existing", "credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]

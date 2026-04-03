@@ -3263,7 +3263,8 @@ pub async fn provider_create(
         }
     }
 
-    if credential_map.is_empty() {
+    let is_keycard = provider_type == openshell_providers::providers::keycard::PROVIDER_TYPE;
+    if credential_map.is_empty() && !is_keycard {
         return Err(miette::miette!(
             "no credentials resolved for provider type '{provider_type}'. \
              Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
