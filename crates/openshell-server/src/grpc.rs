@@ -260,7 +260,7 @@ impl OpenShell for OpenShellService {
                 ))
             })?;
 
-            let provisioned = client.provision_sandbox(&id).await.map_err(|e| {
+            let provisioned = client.provision_sandbox(&id, &name).await.map_err(|e| {
                 warn!(
                     sandbox_id = %id,
                     provider_name = %provider_name,
@@ -720,7 +720,13 @@ impl OpenShell for OpenShellService {
                 let mut found = None;
                 for pname in &spec.providers {
                     if *pname == kc_creds.provider_name {
-                        found = self.state.store.get_message_by_name::<Provider>(pname).await.ok().flatten();
+                        found = self
+                            .state
+                            .store
+                            .get_message_by_name::<Provider>(pname)
+                            .await
+                            .ok()
+                            .flatten();
                         break;
                     }
                 }
@@ -733,7 +739,9 @@ impl OpenShell for OpenShellService {
                 if let Some(kc_config) = KeycardConfig::from_provider_config(&provider.config) {
                     match KeycardClient::new(kc_config) {
                         Ok(client) => {
-                            if let Err(e) = client.delete_application(&kc_creds.application_id).await {
+                            if let Err(e) =
+                                client.delete_application(&kc_creds.application_id).await
+                            {
                                 warn!(
                                     sandbox_id = %id,
                                     application_id = %kc_creds.application_id,
@@ -4270,9 +4278,7 @@ async fn create_provider_record(
         // Keycard providers keep admin credentials in config, not credentials.
         // Validate required config keys are present.
         for key in openshell_providers::providers::keycard::REQUIRED_CONFIG_KEYS {
-            if !provider.config.contains_key(*key)
-                || provider.config[*key].trim().is_empty()
-            {
+            if !provider.config.contains_key(*key) || provider.config[*key].trim().is_empty() {
                 return Err(Status::invalid_argument(format!(
                     "keycard provider requires config key '{key}'"
                 )));
@@ -5004,7 +5010,9 @@ mod tests {
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let kc = KeycardCredentialStore::new();
-        let result = resolve_provider_environment(&store, &[], &kc, "test").await.unwrap();
+        let result = resolve_provider_environment(&store, &[], &kc, "test")
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -5030,9 +5038,10 @@ mod tests {
         create_provider_record(&store, provider).await.unwrap();
 
         let kc = KeycardCredentialStore::new();
-        let result = resolve_provider_environment(&store, &["claude-local".to_string()], &kc, "test")
-            .await
-            .unwrap();
+        let result =
+            resolve_provider_environment(&store, &["claude-local".to_string()], &kc, "test")
+                .await
+                .unwrap();
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
         assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
         // Config values should NOT be injected.
@@ -5069,9 +5078,10 @@ mod tests {
         create_provider_record(&store, provider).await.unwrap();
 
         let kc = KeycardCredentialStore::new();
-        let result = resolve_provider_environment(&store, &["test-provider".to_string()], &kc, "test")
-            .await
-            .unwrap();
+        let result =
+            resolve_provider_environment(&store, &["test-provider".to_string()], &kc, "test")
+                .await
+                .unwrap();
         assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
         assert!(!result.contains_key("nested.api_key"));
         assert!(!result.contains_key("bad-key"));
@@ -5270,7 +5280,10 @@ mod tests {
 
     fn keycard_config_map() -> HashMap<String, String> {
         [
-            ("base_url".to_string(), "https://keycard.example.com".to_string()),
+            (
+                "base_url".to_string(),
+                "https://keycard.example.com".to_string(),
+            ),
             ("zone_id".to_string(), "zone-001".to_string()),
             ("client_id".to_string(), "admin-id".to_string()),
             ("client_secret".to_string(), "admin-secret".to_string()),
@@ -5353,14 +5366,10 @@ mod tests {
         )
         .await;
 
-        let result = resolve_provider_environment(
-            &store,
-            &["my-keycard".to_string()],
-            &kc,
-            "sandbox-abc",
-        )
-        .await
-        .unwrap();
+        let result =
+            resolve_provider_environment(&store, &["my-keycard".to_string()], &kc, "sandbox-abc")
+                .await
+                .unwrap();
 
         assert_eq!(
             result.get("KEYCARD_CLIENT_ID"),
@@ -5416,7 +5425,10 @@ mod tests {
         assert!(!result.values().any(|v| v == "should-not-appear"));
 
         // Sandbox credentials should be present.
-        assert_eq!(result.get("KEYCARD_CLIENT_ID"), Some(&"safe-id".to_string()));
+        assert_eq!(
+            result.get("KEYCARD_CLIENT_ID"),
+            Some(&"safe-id".to_string())
+        );
         assert_eq!(
             result.get("KEYCARD_CLIENT_SECRET"),
             Some(&"safe-secret".to_string())

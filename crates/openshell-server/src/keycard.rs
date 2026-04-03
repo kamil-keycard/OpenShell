@@ -127,10 +127,7 @@ impl KeycardClient {
     ///
     /// Format: `spiffe://{zone_id}/sandbox/{sandbox_id}`
     fn spiffe_id(&self, sandbox_id: &str) -> String {
-        format!(
-            "spiffe://{}/sandbox/{}",
-            self.config.zone_id, sandbox_id
-        )
+        format!("spiffe://{}/sandbox/{}", self.config.zone_id, sandbox_id)
     }
 
     /// Exchange admin credentials for a short-lived Bearer token via the
@@ -169,6 +166,7 @@ impl KeycardClient {
     pub async fn provision_sandbox(
         &self,
         sandbox_id: &str,
+        sandbox_name: &str,
     ) -> Result<ProvisionedApplication, KeycardError> {
         let spiffe_id = self.spiffe_id(sandbox_id);
         let token = self.authenticate().await?;
@@ -176,11 +174,12 @@ impl KeycardClient {
         debug!(
             sandbox_id = %sandbox_id,
             spiffe_id = %spiffe_id,
+            sandbox_name = %sandbox_name,
             "Creating Keycard application"
         );
 
         let app = self
-            .create_application(&token, &spiffe_id, sandbox_id)
+            .create_application(&token, &spiffe_id, sandbox_id, sandbox_name)
             .await?;
 
         info!(
@@ -210,8 +209,7 @@ impl KeycardClient {
             }
         };
 
-        let client_secret =
-            cred.password.ok_or(KeycardError::MissingPassword)?;
+        let client_secret = cred.password.ok_or(KeycardError::MissingPassword)?;
 
         info!(
             sandbox_id = %sandbox_id,
@@ -259,7 +257,8 @@ impl KeycardClient {
         &self,
         token: &str,
         spiffe_id: &str,
-        sandbox_id: &str,
+        _sandbox_id: &str,
+        sandbox_name: &str,
     ) -> Result<ApplicationResponse, KeycardError> {
         let url = format!(
             "{}/zones/{}/applications",
@@ -268,7 +267,7 @@ impl KeycardClient {
 
         let body = CreateApplicationRequest {
             identifier: spiffe_id.to_string(),
-            name: format!("sandbox-{sandbox_id}"),
+            name: sandbox_name.to_string(),
         };
 
         let response = self
@@ -391,7 +390,10 @@ mod tests {
     #[test]
     fn keycard_config_from_provider_config() {
         let mut config = HashMap::new();
-        config.insert("base_url".to_string(), "https://keycard.example.com".to_string());
+        config.insert(
+            "base_url".to_string(),
+            "https://keycard.example.com".to_string(),
+        );
         config.insert("zone_id".to_string(), "zone-001".to_string());
         config.insert("client_id".to_string(), "admin-id".to_string());
         config.insert("client_secret".to_string(), "admin-secret".to_string());
@@ -406,7 +408,10 @@ mod tests {
     #[test]
     fn keycard_config_returns_none_on_missing_key() {
         let mut config = HashMap::new();
-        config.insert("base_url".to_string(), "https://keycard.example.com".to_string());
+        config.insert(
+            "base_url".to_string(),
+            "https://keycard.example.com".to_string(),
+        );
         // Missing zone_id, client_id, client_secret
         assert!(KeycardConfig::from_provider_config(&config).is_none());
     }
@@ -495,7 +500,7 @@ mod tests {
 
     mod wiremock_tests {
         use super::*;
-        use wiremock::matchers::{header, method, path};
+        use wiremock::matchers::{body_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         const TEST_TOKEN: &str = "test-bearer-token";
@@ -512,10 +517,7 @@ mod tests {
         async fn mock_token_endpoint(mock_server: &MockServer) {
             Mock::given(method("POST"))
                 .and(path("/service-account-token"))
-                .and(header(
-                    "content-type",
-                    "application/x-www-form-urlencoded",
-                ))
+                .and(header("content-type", "application/x-www-form-urlencoded"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "access_token": TEST_TOKEN,
                     "token_type": "Bearer",
@@ -542,9 +544,7 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/service-account-token"))
-                .respond_with(
-                    ResponseTemplate::new(401).set_body_string("invalid credentials"),
-                )
+                .respond_with(ResponseTemplate::new(401).set_body_string("invalid credentials"))
                 .expect(1)
                 .mount(&mock_server)
                 .await;
@@ -571,13 +571,17 @@ mod tests {
                 .and(path("/zones/zone-test/applications"))
                 .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .and(header("content-type", "application/json"))
+                .and(body_json(serde_json::json!({
+                    "identifier": "spiffe://zone-test/sandbox/sandbox-001",
+                    "name": "fuzzy-kitten"
+                })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": "internal-app-id",
                     "organization_id": "org-1",
                     "zone_id": "zone-test",
                     "slug": "sandbox-001",
                     "identifier": "spiffe://zone-test/sandbox/sandbox-001",
-                    "name": "sandbox-001",
+                    "name": "fuzzy-kitten",
                     "dependencies_count": 0,
                     "owner_type": "customer",
                     "created_at": "2026-01-01T00:00:00Z",
@@ -609,7 +613,10 @@ mod tests {
 
             let config = test_config(&mock_server.uri());
             let client = KeycardClient::new(config).unwrap();
-            let result = client.provision_sandbox("sandbox-001").await.unwrap();
+            let result = client
+                .provision_sandbox("sandbox-001", "fuzzy-kitten")
+                .await
+                .unwrap();
 
             assert_eq!(result.application_id, "internal-app-id");
             assert_eq!(result.identifier, "spiffe://zone-test/sandbox/sandbox-001");
@@ -623,16 +630,17 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/service-account-token"))
-                .respond_with(
-                    ResponseTemplate::new(401).set_body_string("bad credentials"),
-                )
+                .respond_with(ResponseTemplate::new(401).set_body_string("bad credentials"))
                 .expect(1)
                 .mount(&mock_server)
                 .await;
 
             let config = test_config(&mock_server.uri());
             let client = KeycardClient::new(config).unwrap();
-            let err = client.provision_sandbox("sandbox-auth-fail").await.unwrap_err();
+            let err = client
+                .provision_sandbox("sandbox-auth-fail", "auth-fail-name")
+                .await
+                .unwrap_err();
 
             match err {
                 KeycardError::Api { status, .. } => assert_eq!(status, 401),
@@ -655,7 +663,10 @@ mod tests {
 
             let config = test_config(&mock_server.uri());
             let client = KeycardClient::new(config).unwrap();
-            let err = client.provision_sandbox("sandbox-fail").await.unwrap_err();
+            let err = client
+                .provision_sandbox("sandbox-fail", "fail-name")
+                .await
+                .unwrap_err();
 
             match err {
                 KeycardError::Api { status, body } => {
@@ -708,7 +719,10 @@ mod tests {
 
             let config = test_config(&mock_server.uri());
             let client = KeycardClient::new(config).unwrap();
-            let err = client.provision_sandbox("sandbox-cred-fail").await.unwrap_err();
+            let err = client
+                .provision_sandbox("sandbox-cred-fail", "cred-fail-name")
+                .await
+                .unwrap_err();
 
             match err {
                 KeycardError::Api { status, .. } => assert_eq!(status, 500),
