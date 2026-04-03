@@ -1847,6 +1847,7 @@ pub async fn sandbox_create_with_bootstrap(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
+    secrets: &[String],
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
@@ -1878,6 +1879,7 @@ pub async fn sandbox_create_with_bootstrap(
         remote,
         ssh_key,
         providers,
+        secrets,
         policy,
         forward,
         command,
@@ -1933,6 +1935,7 @@ pub async fn sandbox_create(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
+    secrets: &[String],
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
@@ -2032,11 +2035,20 @@ pub async fn sandbox_create(
         ..SandboxTemplate::default()
     });
 
+    let parsed_secrets: std::collections::HashMap<String, String> = secrets
+        .iter()
+        .filter_map(|s| {
+            let (key, value) = s.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect();
+
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
             policy,
             providers: configured_providers,
+            secrets: parsed_secrets,
             template,
             ..SandboxSpec::default()
         }),

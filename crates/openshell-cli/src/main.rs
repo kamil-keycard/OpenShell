@@ -1141,6 +1141,12 @@ enum SandboxCommands {
         #[arg(long = "provider")]
         providers: Vec<String>,
 
+        /// Per-sandbox secret bindings resolved via Keycard token exchange.
+        /// Format: KEY=URN (e.g., ANTHROPIC_API_KEY=urn:resource:anthropic-api-key).
+        /// Requires a keycard provider to be attached.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
@@ -2102,6 +2108,7 @@ async fn main() -> Result<()> {
                     remote,
                     ssh_key,
                     providers,
+                    secrets,
                     policy,
                     forward,
                     tty,
@@ -2184,6 +2191,7 @@ async fn main() -> Result<()> {
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
+                                &secrets,
                                 policy.as_deref(),
                                 forward,
                                 &command,
@@ -2206,6 +2214,7 @@ async fn main() -> Result<()> {
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
+                                &secrets,
                                 policy.as_deref(),
                                 forward,
                                 &command,
