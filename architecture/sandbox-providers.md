@@ -388,6 +388,19 @@ A single Keycard provider record holds admin API credentials in the `config` map
 The `credentials` map is empty for Keycard providers. Per-sandbox credentials are created
 dynamically and stored in an ephemeral in-memory credential store on the gateway server.
 
+#### Per-Sandbox Secrets
+
+`SandboxSpec` has a `secrets` field (`map<string, string>`) that maps environment variable
+names to Keycard resource URNs:
+
+```protobuf
+map<string, string> secrets = 10;
+```
+
+This allows each sandbox to declare which API keys it needs, resolved at runtime via
+Keycard token exchange. The secrets map is per-sandbox, not per-provider, because different
+sandboxes may need different API keys from the same Keycard provider.
+
 ### SPIFFE Identity
 
 Each sandbox gets a SPIFFE-formatted identity:
@@ -421,16 +434,31 @@ SPIFFE trust domain.
    remove the Keycard APPLICATION.
 3. Cleanup failures are logged but do not block sandbox deletion.
 
-### Credential Resolution
+### Credential Resolution (Token Exchange)
 
 When `resolve_provider_environment()` encounters a Keycard provider, it skips the
-provider's `credentials` and `config` maps entirely. Instead, it reads the per-sandbox
-credentials from the `KeycardCredentialStore` and injects:
+provider's `credentials` and `config` maps entirely. Instead, it performs a server-side
+OAuth2 token exchange for each entry in the sandbox's `secrets` map:
 
-- `KEYCARD_CLIENT_ID` — the per-sandbox client identifier
-- `KEYCARD_CLIENT_SECRET` — the per-sandbox client secret
+1. Reads per-sandbox credentials (`client_id`, `client_secret`, `zone_id`) from the
+   `KeycardCredentialStore`.
+2. For each `(env_key, resource_urn)` in `sandbox.spec.secrets`:
+   - Calls `POST https://{zone_id}.keycard.cloud/oauth/2/token` with the per-sandbox
+     `client_id`/`client_secret` via BasicAuth and `resource={resource_urn}`.
+   - The returned `access_token` is the actual API key (e.g., an Anthropic key).
+   - Injects `{env_key: access_token}` into the resolved environment map.
+3. If the secrets map is empty, the Keycard provider is silently skipped.
 
-Admin credentials from the provider record are never exposed to the sandbox.
+The sandbox never sees the per-sandbox OAuth credentials or the Keycard admin credentials.
+It receives only the actual API keys (e.g., `ANTHROPIC_API_KEY=sk-ant-...`) through the
+standard placeholder/proxy resolution mechanism.
+
+CLI usage:
+
+```bash
+openshell sandbox create --provider my-keycard \
+  --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key
+```
 
 ### Ephemeral Credential Store
 
@@ -439,8 +467,9 @@ The `KeycardCredentialStore` (`crates/openshell-server/src/keycard.rs`) is an in
 
 - `application_id` — Keycard-internal ID for API calls (deletion)
 - `provider_name` — which Keycard provider this credential belongs to
-- `client_id` — per-sandbox client ID for `KEYCARD_CLIENT_ID`
-- `client_secret` — per-sandbox client secret for `KEYCARD_CLIENT_SECRET`
+- `client_id` — per-sandbox client ID for token exchange
+- `client_secret` — per-sandbox client secret for token exchange
+- `zone_id` — zone ID from provider config, used to construct the exchange URL
 
 Credentials exist only in memory, scoped to the sandbox lifetime. They are never persisted
 to the database. If the gateway process restarts, credentials are lost — existing sandboxes
@@ -458,29 +487,34 @@ would need reprovisioning.
 ### End-to-End Flow
 
 ```
-CLI: openshell sandbox create --provider keycard -- agent
+CLI: openshell sandbox create --provider my-keycard \
+       --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key -- claude
   |
   +-- SandboxSpec.providers = ["my-keycard"]
+  +-- SandboxSpec.secrets = {ANTHROPIC_API_KEY: "urn:resource:anthropic-api-key"}
   +-- Sends CreateSandboxRequest to gateway
         |
         Gateway: create_sandbox()
           +-- Validates provider "my-keycard" exists, detects type "keycard"
+          +-- Validates secrets requires keycard provider (fail if none)
           +-- Generates sandbox ID
           +-- Calls Keycard API: POST /zones/{zoneId}/applications
           |     +-- identifier: "spiffe://{zoneId}/sandbox/{sandboxId}"
           +-- Calls Keycard API: POST /zones/{zoneId}/application-credentials
           |     +-- Returns: {identifier: "client-id", password: "client-secret"}
-          +-- Stores in KeycardCredentialStore: sandboxId -> credentials
-          +-- Persists Sandbox, creates K8s resource
+          +-- Stores in KeycardCredentialStore: sandboxId -> {client_id, client_secret, zone_id}
+          +-- Persists Sandbox with spec.secrets, creates K8s resource
                 |
                 Sandbox supervisor: run_sandbox()
                   +-- Fetches provider env via gRPC
                   |     +-- Gateway resolves:
-                  |     |   "my-keycard" (type: keycard) -> ephemeral store lookup
-                  |     |   -> {KEYCARD_CLIENT_ID: "client-id", KEYCARD_CLIENT_SECRET: "client-secret"}
-                  |     +-- Admin creds (base_url, zone_id, client_id, client_secret) NEVER included
+                  |     |   "my-keycard" (type: keycard) -> token exchange for each secret
+                  |     |   POST https://{zoneId}.keycard.cloud/oauth/2/token
+                  |     |     BasicAuth(client-id, client-secret), resource=urn:resource:anthropic-api-key
+                  |     |   -> {ANTHROPIC_API_KEY: "sk-ant-actual-key"}
+                  |     +-- Admin creds and per-sandbox OAuth creds NEVER included
                   +-- Builds placeholder registry + child env
-                  +-- Spawns entrypoint/SSH with KEYCARD_CLIENT_ID, KEYCARD_CLIENT_SECRET placeholders
+                  +-- Spawns entrypoint/SSH with ANTHROPIC_API_KEY placeholder
 
 CLI: openshell sandbox delete my-sandbox
   |
@@ -500,7 +534,9 @@ The gateway enforces:
   `client_id`, `client_secret`) with non-empty values,
 - name uniqueness for providers,
 - generated `id` on create,
-- id preservation on update.
+- id preservation on update,
+- `SandboxSpec.secrets` keys must be valid environment variable names,
+- sandboxes with non-empty `secrets` must have at least one Keycard provider attached.
 
 Providers are stored with `object_type = "provider"` in the shared object store.
 
@@ -517,11 +553,13 @@ Providers are stored with `object_type = "provider"` in the shared object store.
   explicitly kept out of spawned sandbox child-process environments.
 - Keycard admin credentials (base_url, zone_id, client_id, client_secret) are stored in
   the provider `config` map and are used server-side only. They are explicitly excluded
-  from `resolve_provider_environment()` for Keycard providers — the sandbox receives only
-  the per-sandbox ephemeral credentials (KEYCARD_CLIENT_ID, KEYCARD_CLIENT_SECRET).
-- Per-sandbox Keycard credentials exist only in the gateway's in-memory
-  `KeycardCredentialStore` and are scoped to the sandbox lifetime. They are never
-  persisted to the database.
+  from `resolve_provider_environment()` for Keycard providers.
+- Per-sandbox Keycard credentials (client_id, client_secret) exist only in the gateway's
+  in-memory `KeycardCredentialStore`, scoped to the sandbox lifetime. They are never
+  persisted to the database and are never exposed to the sandbox. They are used
+  server-side only for OAuth2 token exchange.
+- The sandbox never sees Keycard OAuth credentials. It receives only the actual API keys
+  (e.g., `ANTHROPIC_API_KEY`) resolved via server-side token exchange.
 
 ## Test Strategy
 
@@ -531,10 +569,11 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 - CLI and gateway integration tests validate end-to-end RPC compatibility.
 - `resolve_provider_environment` unit tests in `crates/openshell-server/src/grpc.rs`.
 - Keycard-specific `resolve_provider_environment` tests verify admin credential filtering,
-  per-sandbox credential injection, and mixed provider scenarios.
-- Keycard HTTP client tests use `wiremock` to mock all three API endpoints (create
-  application, create credential, delete application) with success, failure, and
+  secrets-based token exchange, empty-secrets skipping, and mixed provider scenarios.
+- Keycard HTTP client tests use `wiremock` to mock all API endpoints (create application,
+  create credential, delete application, token exchange) with success, failure, and
   rollback scenarios.
+- Secrets validation tests verify env var key format and keycard provider requirement.
 - `KeycardCredentialStore` unit tests verify isolation between sandboxes.
 - Keycard provider creation tests validate required config key presence.
 - sandbox unit tests validate placeholder generation and header rewriting.
