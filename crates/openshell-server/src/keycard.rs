@@ -27,25 +27,32 @@ struct CreateApplicationRequest {
     name: String,
 }
 
+/// Matches `iam_Application` — we only need `id` and `identifier`.
 #[derive(Debug, Deserialize)]
 struct ApplicationResponse {
     id: String,
-    #[serde(rename = "publicId")]
-    public_id: String,
+    identifier: String,
 }
 
+/// Matches `iam_ApplicationCredentialCreatePassword`.
 #[derive(Debug, Serialize)]
 struct CreateCredentialRequest {
-    #[serde(rename = "applicationId")]
     application_id: String,
     #[serde(rename = "type")]
     credential_type: String,
 }
 
+/// Matches `iam_ApplicationCredentialPassword`.
+/// `password` is only returned on creation.
 #[derive(Debug, Deserialize)]
 struct CredentialResponse {
     identifier: String,
-    password: String,
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,8 +92,8 @@ pub struct KeycardClient {
 pub struct ProvisionedApplication {
     /// Keycard-internal application ID (used for deletion).
     pub application_id: String,
-    /// Public-facing application ID.
-    pub public_id: String,
+    /// Application identifier (the SPIFFE ID we set on creation).
+    pub identifier: String,
     /// Per-sandbox client ID for authentication.
     pub client_id: String,
     /// Per-sandbox client secret for authentication.
@@ -103,6 +110,9 @@ pub enum KeycardError {
 
     #[error("missing keycard config key: {0}")]
     MissingConfig(String),
+
+    #[error("keycard credential response missing password")]
+    MissingPassword,
 }
 
 impl KeycardClient {
@@ -123,6 +133,36 @@ impl KeycardClient {
         )
     }
 
+    /// Exchange admin credentials for a short-lived Bearer token via the
+    /// OAuth2 client_credentials grant.
+    async fn authenticate(&self) -> Result<String, KeycardError> {
+        let url = format!("{}/service-account-token", self.config.base_url);
+
+        let response = self
+            .http
+            .post(&url)
+            .basic_auth(
+                &self.config.admin_client_id,
+                Some(&self.config.admin_client_secret),
+            )
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("grant_type=client_credentials")
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(KeycardError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let token: TokenResponse = response.json().await?;
+        Ok(token.access_token)
+    }
+
     /// Create a Keycard APPLICATION and generate password credentials for a sandbox.
     ///
     /// Returns the provisioned application details including the ephemeral credentials.
@@ -131,6 +171,7 @@ impl KeycardClient {
         sandbox_id: &str,
     ) -> Result<ProvisionedApplication, KeycardError> {
         let spiffe_id = self.spiffe_id(sandbox_id);
+        let token = self.authenticate().await?;
 
         debug!(
             sandbox_id = %sandbox_id,
@@ -138,16 +179,18 @@ impl KeycardClient {
             "Creating Keycard application"
         );
 
-        let app = self.create_application(&spiffe_id, sandbox_id).await?;
+        let app = self
+            .create_application(&token, &spiffe_id, sandbox_id)
+            .await?;
 
         info!(
             sandbox_id = %sandbox_id,
             application_id = %app.id,
-            public_id = %app.public_id,
+            identifier = %app.identifier,
             "Keycard application created"
         );
 
-        let cred = match self.create_credential(&app.id).await {
+        let cred = match self.create_credential(&token, &app.id).await {
             Ok(cred) => cred,
             Err(e) => {
                 warn!(
@@ -167,6 +210,9 @@ impl KeycardClient {
             }
         };
 
+        let client_secret =
+            cred.password.ok_or(KeycardError::MissingPassword)?;
+
         info!(
             sandbox_id = %sandbox_id,
             application_id = %app.id,
@@ -175,14 +221,15 @@ impl KeycardClient {
 
         Ok(ProvisionedApplication {
             application_id: app.id,
-            public_id: app.public_id,
+            identifier: app.identifier,
             client_id: cred.identifier,
-            client_secret: cred.password,
+            client_secret,
         })
     }
 
     /// Delete a Keycard APPLICATION by its internal ID.
     pub async fn delete_application(&self, application_id: &str) -> Result<(), KeycardError> {
+        let token = self.authenticate().await?;
         let url = format!(
             "{}/zones/{}/applications/{}",
             self.config.base_url, self.config.zone_id, application_id
@@ -191,7 +238,7 @@ impl KeycardClient {
         let response = self
             .http
             .delete(&url)
-            .basic_auth(&self.config.admin_client_id, Some(&self.config.admin_client_secret))
+            .bearer_auth(&token)
             .header(ACCEPT, "application/json")
             .send()
             .await?;
@@ -210,6 +257,7 @@ impl KeycardClient {
 
     async fn create_application(
         &self,
+        token: &str,
         spiffe_id: &str,
         sandbox_id: &str,
     ) -> Result<ApplicationResponse, KeycardError> {
@@ -226,7 +274,7 @@ impl KeycardClient {
         let response = self
             .http
             .post(&url)
-            .basic_auth(&self.config.admin_client_id, Some(&self.config.admin_client_secret))
+            .bearer_auth(token)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .json(&body)
@@ -247,6 +295,7 @@ impl KeycardClient {
 
     async fn create_credential(
         &self,
+        token: &str,
         application_id: &str,
     ) -> Result<CredentialResponse, KeycardError> {
         let url = format!(
@@ -262,7 +311,7 @@ impl KeycardClient {
         let response = self
             .http
             .post(&url)
-            .basic_auth(&self.config.admin_client_id, Some(&self.config.admin_client_secret))
+            .bearer_auth(token)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json")
             .json(&body)
@@ -449,6 +498,8 @@ mod tests {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        const TEST_TOKEN: &str = "test-bearer-token";
+
         fn test_config(base_url: &str) -> KeycardConfig {
             KeycardConfig {
                 base_url: base_url.to_string(),
@@ -458,16 +509,79 @@ mod tests {
             }
         }
 
+        async fn mock_token_endpoint(mock_server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(path("/service-account-token"))
+                .and(header(
+                    "content-type",
+                    "application/x-www-form-urlencoded",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": TEST_TOKEN,
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                })))
+                .mount(mock_server)
+                .await;
+        }
+
         #[tokio::test]
-        async fn provision_sandbox_success() {
+        async fn authenticate_success() {
+            let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let token = client.authenticate().await.unwrap();
+            assert_eq!(token, TEST_TOKEN);
+        }
+
+        #[tokio::test]
+        async fn authenticate_failure() {
             let mock_server = MockServer::start().await;
 
             Mock::given(method("POST"))
+                .and(path("/service-account-token"))
+                .respond_with(
+                    ResponseTemplate::new(401).set_body_string("invalid credentials"),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let err = client.authenticate().await.unwrap_err();
+
+            match err {
+                KeycardError::Api { status, body } => {
+                    assert_eq!(status, 401);
+                    assert!(body.contains("invalid credentials"));
+                }
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn provision_sandbox_success() {
+            let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
+
+            Mock::given(method("POST"))
                 .and(path("/zones/zone-test/applications"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .and(header("content-type", "application/json"))
-                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": "internal-app-id",
-                    "publicId": "public-app-id"
+                    "organization_id": "org-1",
+                    "zone_id": "zone-test",
+                    "slug": "sandbox-001",
+                    "identifier": "spiffe://zone-test/sandbox/sandbox-001",
+                    "name": "sandbox-001",
+                    "dependencies_count": 0,
+                    "owner_type": "customer",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
                 })))
                 .expect(1)
                 .mount(&mock_server)
@@ -475,10 +589,19 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/zones/zone-test/application-credentials"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .and(header("content-type", "application/json"))
-                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "cred-1",
+                    "organization_id": "org-1",
+                    "zone_id": "zone-test",
+                    "slug": "cred-sandbox-001",
+                    "application_id": "internal-app-id",
+                    "type": "password",
                     "identifier": "sandbox-client-id",
-                    "password": "sandbox-client-secret"
+                    "password": "sandbox-client-secret",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
                 })))
                 .expect(1)
                 .mount(&mock_server)
@@ -489,17 +612,42 @@ mod tests {
             let result = client.provision_sandbox("sandbox-001").await.unwrap();
 
             assert_eq!(result.application_id, "internal-app-id");
-            assert_eq!(result.public_id, "public-app-id");
+            assert_eq!(result.identifier, "spiffe://zone-test/sandbox/sandbox-001");
             assert_eq!(result.client_id, "sandbox-client-id");
             assert_eq!(result.client_secret, "sandbox-client-secret");
         }
 
         #[tokio::test]
-        async fn provision_sandbox_app_creation_failure() {
+        async fn provision_sandbox_auth_failure() {
             let mock_server = MockServer::start().await;
 
             Mock::given(method("POST"))
+                .and(path("/service-account-token"))
+                .respond_with(
+                    ResponseTemplate::new(401).set_body_string("bad credentials"),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let config = test_config(&mock_server.uri());
+            let client = KeycardClient::new(config).unwrap();
+            let err = client.provision_sandbox("sandbox-auth-fail").await.unwrap_err();
+
+            match err {
+                KeycardError::Api { status, .. } => assert_eq!(status, 401),
+                other => panic!("expected Api error, got: {other}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn provision_sandbox_app_creation_failure() {
+            let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
+
+            Mock::given(method("POST"))
                 .and(path("/zones/zone-test/applications"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
                 .expect(1)
                 .mount(&mock_server)
@@ -521,12 +669,22 @@ mod tests {
         #[tokio::test]
         async fn provision_sandbox_credential_failure_cleans_up_app() {
             let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
 
             Mock::given(method("POST"))
                 .and(path("/zones/zone-test/applications"))
-                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "id": "app-to-cleanup",
-                    "publicId": "public-cleanup"
+                    "organization_id": "org-1",
+                    "zone_id": "zone-test",
+                    "slug": "sandbox-cred-fail",
+                    "identifier": "spiffe://zone-test/sandbox/sandbox-cred-fail",
+                    "name": "sandbox-cred-fail",
+                    "dependencies_count": 0,
+                    "owner_type": "customer",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
                 })))
                 .expect(1)
                 .mount(&mock_server)
@@ -534,14 +692,15 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/zones/zone-test/application-credentials"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .respond_with(ResponseTemplate::new(500).set_body_string("cred error"))
                 .expect(1)
                 .mount(&mock_server)
                 .await;
 
-            // The cleanup call should try to delete the application.
             Mock::given(method("DELETE"))
                 .and(path("/zones/zone-test/applications/app-to-cleanup"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .respond_with(ResponseTemplate::new(204))
                 .expect(1)
                 .mount(&mock_server)
@@ -560,9 +719,11 @@ mod tests {
         #[tokio::test]
         async fn delete_application_success() {
             let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
 
             Mock::given(method("DELETE"))
                 .and(path("/zones/zone-test/applications/app-123"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .respond_with(ResponseTemplate::new(204))
                 .expect(1)
                 .mount(&mock_server)
@@ -576,9 +737,11 @@ mod tests {
         #[tokio::test]
         async fn delete_application_not_found_is_ok() {
             let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
 
             Mock::given(method("DELETE"))
                 .and(path("/zones/zone-test/applications/gone"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .respond_with(ResponseTemplate::new(404))
                 .expect(1)
                 .mount(&mock_server)
@@ -586,16 +749,17 @@ mod tests {
 
             let config = test_config(&mock_server.uri());
             let client = KeycardClient::new(config).unwrap();
-            // 404 should not be an error (idempotent delete).
             client.delete_application("gone").await.unwrap();
         }
 
         #[tokio::test]
         async fn delete_application_server_error() {
             let mock_server = MockServer::start().await;
+            mock_token_endpoint(&mock_server).await;
 
             Mock::given(method("DELETE"))
                 .and(path("/zones/zone-test/applications/app-err"))
+                .and(header("authorization", format!("Bearer {TEST_TOKEN}")))
                 .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
                 .expect(1)
                 .mount(&mock_server)
