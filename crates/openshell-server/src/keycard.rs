@@ -225,6 +225,47 @@ impl KeycardClient {
         })
     }
 
+    /// Exchange a per-sandbox credential for an access token scoped to a resource URN.
+    ///
+    /// Calls `https://{zone_id}.keycard.cloud/oauth/2/token` using the per-sandbox
+    /// `client_id`/`client_secret` via BasicAuth. Returns the `access_token` which
+    /// is the actual API key (e.g. an Anthropic key) for the requested resource.
+    pub async fn exchange_token(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        resource_urn: &str,
+    ) -> Result<String, KeycardError> {
+        let url = format!(
+            "https://{}.keycard.cloud/oauth/2/token",
+            self.config.zone_id
+        );
+
+        let response = self
+            .http
+            .post(&url)
+            .basic_auth(client_id, Some(client_secret))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("resource", resource_urn),
+            ])
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(KeycardError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let token: TokenResponse = response.json().await?;
+        Ok(token.access_token)
+    }
+
     /// Delete a Keycard APPLICATION by its internal ID.
     pub async fn delete_application(&self, application_id: &str) -> Result<(), KeycardError> {
         let token = self.authenticate().await?;
@@ -344,10 +385,12 @@ pub struct SandboxKeycardCredentials {
     pub application_id: String,
     /// Provider name this credential belongs to.
     pub provider_name: String,
-    /// Per-sandbox client ID injected as KEYCARD_CLIENT_ID.
+    /// Per-sandbox client ID for Keycard token exchange.
     pub client_id: String,
-    /// Per-sandbox client secret injected as KEYCARD_CLIENT_SECRET.
+    /// Per-sandbox client secret for Keycard token exchange.
     pub client_secret: String,
+    /// Zone ID from the provider config, used to build the token exchange URL.
+    pub zone_id: String,
 }
 
 /// Thread-safe ephemeral store for per-sandbox Keycard credentials.
@@ -440,6 +483,7 @@ mod tests {
             provider_name: "my-keycard".to_string(),
             client_id: "client-1".to_string(),
             client_secret: "secret-1".to_string(),
+            zone_id: "zone-001".to_string(),
         };
 
         store.insert("sandbox-1".to_string(), creds.clone()).await;
@@ -473,6 +517,7 @@ mod tests {
                     provider_name: "kc".to_string(),
                     client_id: "id-a".to_string(),
                     client_secret: "secret-a".to_string(),
+                    zone_id: "zone-001".to_string(),
                 },
             )
             .await;
@@ -484,6 +529,7 @@ mod tests {
                     provider_name: "kc".to_string(),
                     client_id: "id-b".to_string(),
                     client_secret: "secret-b".to_string(),
+                    zone_id: "zone-001".to_string(),
                 },
             )
             .await;

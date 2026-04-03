@@ -33,6 +33,9 @@ message SandboxSpec {
   repeated string providers = 8;
   // Request NVIDIA GPU resources for this sandbox.
   bool gpu = 9;
+  // Per-sandbox secret bindings resolved via Keycard token exchange.
+  // Key: env var name exposed to the sandbox, Value: Keycard resource URN.
+  map<string, string> secrets = 10;
 }
 
 // Sandbox template mapped onto Kubernetes pod template inputs.

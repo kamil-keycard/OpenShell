@@ -281,6 +281,7 @@ impl OpenShell for OpenShellService {
                         provider_name: provider_name.clone(),
                         client_id: provisioned.client_id,
                         client_secret: provisioned.client_secret,
+                        zone_id: kc_config.zone_id.clone(),
                     },
                 )
                 .await;
@@ -5362,6 +5363,7 @@ mod tests {
                 provider_name: "my-keycard".to_string(),
                 client_id: "sandbox-client-id".to_string(),
                 client_secret: "sandbox-client-secret".to_string(),
+                zone_id: "zone-001".to_string(),
             },
         )
         .await;
@@ -5407,6 +5409,7 @@ mod tests {
                 provider_name: "sneaky-keycard".to_string(),
                 client_id: "safe-id".to_string(),
                 client_secret: "safe-secret".to_string(),
+                zone_id: "zone-001".to_string(),
             },
         )
         .await;
@@ -5506,6 +5509,7 @@ mod tests {
                 provider_name: "my-keycard".to_string(),
                 client_id: "kc-id".to_string(),
                 client_secret: "kc-secret".to_string(),
+                zone_id: "zone-001".to_string(),
             },
         )
         .await;
