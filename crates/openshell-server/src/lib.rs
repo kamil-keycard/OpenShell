@@ -13,6 +13,7 @@ mod auth;
 mod grpc;
 mod http;
 mod inference;
+pub mod keycard;
 mod multiplex;
 mod persistence;
 mod sandbox;
@@ -32,6 +33,7 @@ use tracing::{debug, error, info};
 
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
+use keycard::KeycardCredentialStore;
 pub use multiplex::{MultiplexService, MultiplexedService};
 use persistence::Store;
 use sandbox::{SandboxClient, spawn_sandbox_watcher, spawn_store_reconciler};
@@ -72,6 +74,9 @@ pub struct ServerState {
     /// set/delete operation, including the precedence check on sandbox
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
+
+    /// Ephemeral per-sandbox Keycard credentials, scoped to sandbox lifetime.
+    pub keycard_credentials: KeycardCredentialStore,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -102,6 +107,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            keycard_credentials: KeycardCredentialStore::new(),
         }
     }
 }

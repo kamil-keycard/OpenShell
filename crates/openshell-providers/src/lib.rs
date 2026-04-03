@@ -5,7 +5,7 @@
 
 mod context;
 mod discovery;
-mod providers;
+pub mod providers;
 #[cfg(test)]
 mod test_helpers;
 
