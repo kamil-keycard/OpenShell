@@ -207,6 +207,13 @@ impl OpenShell for OpenShellService {
             }
         }
 
+        // Sandboxes with secrets must have at least one keycard provider.
+        if !spec.secrets.is_empty() && keycard_providers.is_empty() {
+            return Err(Status::invalid_argument(
+                "sandbox has secrets but no keycard provider attached",
+            ));
+        }
+
         // Ensure the template always carries the resolved image so clients
         // (CLI, TUI, etc.) can read the actual image from the stored sandbox.
         let mut spec = spec;
@@ -3278,6 +3285,22 @@ fn validate_sandbox_spec(
     // --- spec.template ---
     if let Some(ref tmpl) = spec.template {
         validate_sandbox_template(tmpl)?;
+    }
+
+    // --- spec.secrets ---
+    validate_string_map(
+        &spec.secrets,
+        MAX_ENVIRONMENT_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "spec.secrets",
+    )?;
+    for key in spec.secrets.keys() {
+        if !is_valid_env_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "spec.secrets key '{key}' is not a valid environment variable name"
+            )));
+        }
     }
 
     // --- spec.policy serialized size ---
