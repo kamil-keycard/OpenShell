@@ -3821,13 +3821,12 @@ async fn resolve_provider_environment(
                 ))
             })?;
 
-            let kc_config =
-                crate::keycard::KeycardConfig::from_provider_config(&provider.config)
-                    .ok_or_else(|| {
-                        Status::internal(format!(
-                            "keycard provider '{name}' missing required config keys"
-                        ))
-                    })?;
+            let kc_config = crate::keycard::KeycardConfig::from_provider_config(&provider.config)
+                .ok_or_else(|| {
+                Status::internal(format!(
+                    "keycard provider '{name}' missing required config keys"
+                ))
+            })?;
 
             let kc_client = crate::keycard::KeycardClient::new(kc_config).map_err(|e| {
                 Status::internal(format!(
@@ -6393,12 +6392,9 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_rejects_invalid_secrets_key() {
         let spec = SandboxSpec {
-            secrets: [(
-                "bad-key".to_string(),
-                "urn:resource:test".to_string(),
-            )]
-            .into_iter()
-            .collect(),
+            secrets: [("bad-key".to_string(), "urn:resource:test".to_string())]
+                .into_iter()
+                .collect(),
             ..Default::default()
         };
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
