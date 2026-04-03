@@ -95,8 +95,11 @@ pub trait ProviderPlugin: Send + Sync {
 | `gitlab.rs` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | `~/.config/glab-cli/config.yml` |
 | `github.rs` | `GITHUB_TOKEN`, `GH_TOKEN` | `~/.config/gh/hosts.yml` |
 | `outlook.rs` | *(none)* | *(none)* |
+| `keycard.rs` | *(none — lifecycle provider)* | *(none)* |
 
-`generic` and `outlook` are stubs — `discover_existing()` always returns `None`.
+`generic`, `outlook`, and `keycard` are stubs for discovery — `discover_existing()` always
+returns `None`. The keycard provider is a lifecycle-aware provider (see below) rather than
+a passive credential store.
 
 Each plugin defines a `ProviderDiscoverySpec` with its `id`, `credential_env_vars`, and
 `config_paths`. The registry is assembled in `ProviderRegistry::new()` by registering
@@ -363,11 +366,138 @@ CLI: openshell sandbox create -- claude
                       +-- Proxy rewrites outbound auth header placeholders -> real secrets
 ```
 
+## Keycard Provider (Lifecycle-Aware)
+
+The Keycard provider is architecturally distinct from all other providers. While standard
+providers are passive credential stores, the Keycard provider is lifecycle-aware: it makes
+external API calls during sandbox provisioning and decommissioning to create and destroy
+per-sandbox application identities.
+
+### Data Model
+
+A single Keycard provider record holds admin API credentials in the `config` map (not
+`credentials`), preventing them from being injected into sandboxes:
+
+| Config Key | Description |
+|-----------|-------------|
+| `base_url` | Keycard API base URL |
+| `zone_id` | Keycard zone ID (also used as the SPIFFE trust domain) |
+| `client_id` | Admin client ID for Keycard API authentication |
+| `client_secret` | Admin client secret for Keycard API authentication |
+
+The `credentials` map is empty for Keycard providers. Per-sandbox credentials are created
+dynamically and stored in an ephemeral in-memory credential store on the gateway server.
+
+### SPIFFE Identity
+
+Each sandbox gets a SPIFFE-formatted identity:
+
+```
+spiffe://{zone_id}/sandbox/{sandbox_id}
+```
+
+This identifier is used when creating the Keycard APPLICATION. The zone ID serves as the
+SPIFFE trust domain.
+
+### Sandbox Lifecycle
+
+**Provisioning (`create_sandbox()`):**
+
+1. After sandbox ID generation, the server checks if any listed provider has type `keycard`.
+2. For each Keycard provider, the server extracts admin config and creates a `KeycardClient`.
+3. The client calls `POST /zones/{zoneId}/applications` with the SPIFFE ID as identifier.
+4. The client calls `POST /zones/{zoneId}/application-credentials` to generate a password
+   credential for the application.
+5. The returned `identifier` (client ID) and `password` (client secret) are stored in the
+   `KeycardCredentialStore` keyed by sandbox ID.
+6. If any Keycard API call fails, sandbox creation is aborted entirely (fail-closed).
+7. If K8s resource creation fails after Keycard provisioning, the ephemeral credentials are
+   cleaned up from the store.
+
+**Decommissioning (`delete_sandbox()`):**
+
+1. The server removes the sandbox's entry from the `KeycardCredentialStore`.
+2. If credentials existed, the server calls `DELETE /zones/{zoneId}/applications/{id}` to
+   remove the Keycard APPLICATION.
+3. Cleanup failures are logged but do not block sandbox deletion.
+
+### Credential Resolution
+
+When `resolve_provider_environment()` encounters a Keycard provider, it skips the
+provider's `credentials` and `config` maps entirely. Instead, it reads the per-sandbox
+credentials from the `KeycardCredentialStore` and injects:
+
+- `KEYCARD_CLIENT_ID` — the per-sandbox client identifier
+- `KEYCARD_CLIENT_SECRET` — the per-sandbox client secret
+
+Admin credentials from the provider record are never exposed to the sandbox.
+
+### Ephemeral Credential Store
+
+The `KeycardCredentialStore` (`crates/openshell-server/src/keycard.rs`) is an in-memory
+`HashMap<String, SandboxKeycardCredentials>` protected by a `RwLock`. Each entry stores:
+
+- `application_id` — Keycard-internal ID for API calls (deletion)
+- `provider_name` — which Keycard provider this credential belongs to
+- `client_id` — per-sandbox client ID for `KEYCARD_CLIENT_ID`
+- `client_secret` — per-sandbox client secret for `KEYCARD_CLIENT_SECRET`
+
+Credentials exist only in memory, scoped to the sandbox lifetime. They are never persisted
+to the database. If the gateway process restarts, credentials are lost — existing sandboxes
+would need reprovisioning.
+
+### Components
+
+| File | Role |
+|------|------|
+| `crates/openshell-providers/src/providers/keycard.rs` | Provider plugin (type registration, discovery stub) |
+| `crates/openshell-server/src/keycard.rs` | Keycard HTTP client, ephemeral credential store |
+| `crates/openshell-server/src/grpc.rs` | Lifecycle hooks in `create_sandbox()` and `delete_sandbox()` |
+| `crates/openshell-server/src/lib.rs` | `KeycardCredentialStore` in `ServerState` |
+
+### End-to-End Flow
+
+```
+CLI: openshell sandbox create --provider keycard -- agent
+  |
+  +-- SandboxSpec.providers = ["my-keycard"]
+  +-- Sends CreateSandboxRequest to gateway
+        |
+        Gateway: create_sandbox()
+          +-- Validates provider "my-keycard" exists, detects type "keycard"
+          +-- Generates sandbox ID
+          +-- Calls Keycard API: POST /zones/{zoneId}/applications
+          |     +-- identifier: "spiffe://{zoneId}/sandbox/{sandboxId}"
+          +-- Calls Keycard API: POST /zones/{zoneId}/application-credentials
+          |     +-- Returns: {identifier: "client-id", password: "client-secret"}
+          +-- Stores in KeycardCredentialStore: sandboxId -> credentials
+          +-- Persists Sandbox, creates K8s resource
+                |
+                Sandbox supervisor: run_sandbox()
+                  +-- Fetches provider env via gRPC
+                  |     +-- Gateway resolves:
+                  |     |   "my-keycard" (type: keycard) -> ephemeral store lookup
+                  |     |   -> {KEYCARD_CLIENT_ID: "client-id", KEYCARD_CLIENT_SECRET: "client-secret"}
+                  |     +-- Admin creds (base_url, zone_id, client_id, client_secret) NEVER included
+                  +-- Builds placeholder registry + child env
+                  +-- Spawns entrypoint/SSH with KEYCARD_CLIENT_ID, KEYCARD_CLIENT_SECRET placeholders
+
+CLI: openshell sandbox delete my-sandbox
+  |
+  +-- Gateway: delete_sandbox()
+        +-- Removes credentials from KeycardCredentialStore
+        +-- Calls Keycard API: DELETE /zones/{zoneId}/applications/{appId}
+        +-- Deletes K8s resource, cleans up SSH sessions, settings, bus entries
+```
+
 ## Persistence and Validation
 
 The gateway enforces:
 
 - `provider.type` must be non-empty,
+- `provider.credentials` must be non-empty (except for Keycard providers),
+- Keycard providers must have all required config keys (`base_url`, `zone_id`,
+  `client_id`, `client_secret`) with non-empty values,
 - name uniqueness for providers,
 - generated `id` on create,
 - id preservation on update.
@@ -385,6 +515,13 @@ Providers are stored with `object_type = "provider"` in the shared object store.
   placeholders, and the supervisor resolves those placeholders during outbound proxying.
 - `OPENSHELL_SSH_HANDSHAKE_SECRET` is required by the supervisor/SSH server path but is
   explicitly kept out of spawned sandbox child-process environments.
+- Keycard admin credentials (base_url, zone_id, client_id, client_secret) are stored in
+  the provider `config` map and are used server-side only. They are explicitly excluded
+  from `resolve_provider_environment()` for Keycard providers — the sandbox receives only
+  the per-sandbox ephemeral credentials (KEYCARD_CLIENT_ID, KEYCARD_CLIENT_SECRET).
+- Per-sandbox Keycard credentials exist only in the gateway's in-memory
+  `KeycardCredentialStore` and are scoped to the sandbox lifetime. They are never
+  persisted to the database.
 
 ## Test Strategy
 
@@ -393,6 +530,13 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 - Mocked discovery context tests cover env and path-based behavior.
 - CLI and gateway integration tests validate end-to-end RPC compatibility.
 - `resolve_provider_environment` unit tests in `crates/openshell-server/src/grpc.rs`.
+- Keycard-specific `resolve_provider_environment` tests verify admin credential filtering,
+  per-sandbox credential injection, and mixed provider scenarios.
+- Keycard HTTP client tests use `wiremock` to mock all three API endpoints (create
+  application, create credential, delete application) with success, failure, and
+  rollback scenarios.
+- `KeycardCredentialStore` unit tests verify isolation between sandboxes.
+- Keycard provider creation tests validate required config key presence.
 - sandbox unit tests validate placeholder generation and header rewriting.
 - E2E sandbox tests verify placeholders are visible in child env, outbound proxy traffic
   is rewritten with the real secret, and the SSH handshake secret is absent from exec env.
