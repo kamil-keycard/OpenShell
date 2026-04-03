@@ -873,7 +873,11 @@ mod tests {
 
             let client = test_client_with_exchange(&mock_server.uri(), &mock_server.uri());
             let token = client
-                .exchange_token("sb-client-id", "sb-client-secret", "urn:resource:anthropic-api-key")
+                .exchange_token(
+                    "sb-client-id",
+                    "sb-client-secret",
+                    "urn:resource:anthropic-api-key",
+                )
                 .await
                 .unwrap();
 
