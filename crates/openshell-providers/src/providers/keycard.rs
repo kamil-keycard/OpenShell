@@ -26,9 +26,6 @@ pub const REQUIRED_CONFIG_KEYS: &[&str] = &[
     CONFIG_CLIENT_SECRET,
 ];
 
-pub const ENV_KEYCARD_CLIENT_ID: &str = "KEYCARD_CLIENT_ID";
-pub const ENV_KEYCARD_CLIENT_SECRET: &str = "KEYCARD_CLIENT_SECRET";
-
 impl ProviderPlugin for KeycardProvider {
     fn id(&self) -> &'static str {
         PROVIDER_TYPE
@@ -41,7 +38,10 @@ impl ProviderPlugin for KeycardProvider {
     }
 
     fn credential_env_vars(&self) -> &'static [&'static str] {
-        &[ENV_KEYCARD_CLIENT_ID, ENV_KEYCARD_CLIENT_SECRET]
+        // Keycard providers don't define fixed credential env vars. The actual
+        // env vars are declared per-sandbox via the `secrets` map on SandboxSpec
+        // and resolved server-side via token exchange.
+        &[]
     }
 }
 
@@ -64,9 +64,9 @@ mod tests {
     }
 
     #[test]
-    fn keycard_provider_credential_env_vars() {
+    fn keycard_provider_credential_env_vars_is_empty() {
         let provider = KeycardProvider;
         let vars = provider.credential_env_vars();
-        assert_eq!(vars, &["KEYCARD_CLIENT_ID", "KEYCARD_CLIENT_SECRET"]);
+        assert!(vars.is_empty());
     }
 }
