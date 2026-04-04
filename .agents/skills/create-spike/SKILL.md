@@ -1,18 +1,17 @@
 ---
 name: create-spike
-description: Investigate a plain-language problem description by deeply exploring the codebase, then create a structured GitHub issue with technical findings. Prequel to build-from-issue — maps vague ideas to concrete, buildable issues. Trigger keywords - spike, investigate, explore, research issue, technical investigation, create spike, new spike, feasibility, codebase exploration.
+description: Investigate a plain-language problem description by deeply exploring the codebase, then write a structured spike document in docs/specs/. Prequel to build-from-issue — maps vague ideas to concrete, buildable specs. Trigger keywords - spike, investigate, explore, research issue, technical investigation, create spike, new spike, feasibility, codebase exploration.
 ---
 
 # Create Spike
 
-Investigate a problem, map it to the codebase, and produce a structured GitHub issue ready for `build-from-issue`.
+Investigate a problem, map it to the codebase, and produce a structured spike document in `docs/specs/`.
 
 A **spike** is an exploratory investigation. The user has a vague idea — a feature they want, a bug they've noticed, a performance concern — but hasn't mapped it to code, assessed feasibility, or structured it as a buildable issue. This skill does that mapping.
 
 ## Prerequisites
 
-- The `gh` CLI must be authenticated (`gh auth status`)
-- You must be in a git repository with a GitHub remote
+- You must be in the repository root
 
 ## Workflow Overview
 
@@ -25,11 +24,9 @@ User describes a problem
   ├─ Step 2: Deep codebase investigation via principal-engineer-reviewer
   │   └─ Map the problem to code, assess feasibility, identify risks
   │
-  ├─ Step 3: Determine labels from the repo
+  ├─ Step 3: Write the spike document to docs/specs/
   │
-  ├─ Step 4: Create a GitHub issue with structured findings
-  │
-  └─ Step 5: Report to user with issue URL and next steps
+  └─ Step 4: Report to user with file path and next steps
 ```
 
 ## Step 1: Gather the Problem Statement
@@ -103,32 +100,21 @@ Include in the prompt to the reviewer:
 
 ### What to do with the results
 
-The reviewer will return a detailed analysis. You'll use this to populate the issue body (Step 4). The issue should contain both the stakeholder-readable summary and the full technical investigation — everything in one place.
+The reviewer will return a detailed analysis. You'll use this to populate the spike document (Step 3). The document should contain both the stakeholder-readable summary and the full technical investigation — everything in one place.
 
-## Step 3: Determine Labels
+## Step 3: Write the Spike Document
 
-Fetch the available labels from the repository:
+Write the spike as a markdown file in `docs/specs/`. Use the naming convention: `<UPPERCASE-HYPHENATED-DESCRIPTION>-SPIKE.md`.
 
-```bash
-gh label list --limit 100
-```
+Derive the filename from the problem description. Examples:
 
-Based on the investigation results, select appropriate labels:
+- "Allow sandbox egress to private IPs" → `SANDBOX-PRIVATE-IP-EGRESS-SPIKE.md`
+- "Proxy retry logic causes cascading failures" → `PROXY-RETRY-CASCADE-SPIKE.md`
+- "Cache compiled OPA policies" → `OPA-POLICY-CACHE-SPIKE.md`
 
-- **Do not add issue type labels** — GitHub built-in issue types come from issue templates or manual follow-up, not labels
-- **Include area labels** if they exist in the repo (e.g., `area:sandbox`, `area:proxy`, `area:policy`, `area:cli`)
-- **Do not invent labels** — only use labels that already exist in the repo
-- **Add `state:review-ready`** — the issue is ready for human review upon creation
+The file should contain both the stakeholder-readable summary and the full technical investigation:
 
-## Step 4: Create the GitHub Issue
-
-Create the issue with a structured body containing both the stakeholder-readable summary and the full technical investigation. The title should follow conventional commit format.
-
-```bash
-gh issue create \
-  --title "<type>: <concise description of the problem/feature>" \
-  --label "<area:component>" --label "state:review-ready" \
-  --body "$(cat <<'EOF'
+```markdown
 ## Problem Statement
 
 <What and why — refined from the user's description. 2-4 sentences. Written for stakeholders, not just engineers.>
@@ -200,49 +186,30 @@ gh issue create \
 
 ---
 *Created by spike investigation. Use `build-from-issue` to plan and implement.*
-EOF
-)"
 ```
 
-**Do NOT post a follow-up comment on the issue.** All findings must be contained in the issue body itself.
+## Step 4: Report to User
 
-**Display the issue URL** so it's easily clickable:
+After writing the spike document, report:
 
-```
-Created issue [#<number>](https://github.com/OWNER/REPO/issues/<number>)
-```
-
-## Step 5: Report to User
-
-After creating the issue, report:
-
-1. The issue URL (as a clickable markdown link)
+1. The file path (e.g., `docs/specs/SANDBOX-PRIVATE-IP-EGRESS-SPIKE.md`)
 2. A 2-3 sentence summary of what was found
 3. Key risks or decisions that need human attention
 4. Next steps:
 
-> Review the issue. Refine the proposed approach if needed, then use `build-from-issue` on the issue to create an implementation plan and build it.
+> Review the spike document. Refine the proposed approach if needed, then use `build-from-issue` to create an implementation plan and build it.
 
 ## Design Principles
 
-1. **Everything goes in the issue body.** Do NOT post follow-up comments. The issue body should contain both the stakeholder-readable summary and the full technical investigation, all in one place.
+1. **Everything goes in one document.** The spike file should contain both the stakeholder-readable summary and the full technical investigation, all in one place.
 
 2. **Do NOT create an implementation plan.** The spike identifies the problem space and proposes a direction. The implementation plan is `build-from-issue`'s responsibility, created after human review of the spike.
 
 3. **One round of clarification max.** Don't turn this into an interrogation. If the user provides enough to identify the area of the codebase, start investigating.
 
-4. **The issue should save `build-from-issue` work.** When `build-from-issue` runs, it reads the issue body as input context. The technical investigation section should contain enough detail that its `principal-engineer-reviewer` can build on the investigation rather than starting from scratch.
+4. **The spike should save `build-from-issue` work.** When `build-from-issue` runs, the technical investigation section should contain enough detail that its `principal-engineer-reviewer` can build on the investigation rather than starting from scratch.
 
-5. **Cross-reference `build-from-issue`.** Mention it as the natural next step in the issue body footer.
-
-## Useful Commands Reference
-
-| Command | Description |
-| --- | --- |
-| `gh issue create --title "..." --body "..." --label "..."` | Create a new issue |
-| `gh label list --limit 100` | List available labels in the repo |
-| `gh issue edit <id> --add-label "..."` | Add labels to an issue |
-| `gh issue view <id> --json number,title,body,state,labels` | Fetch issue metadata |
+5. **Cross-reference `build-from-issue`.** Mention it as the natural next step in the spike footer.
 
 ## Example Usage
 
@@ -259,9 +226,8 @@ User says: "Allow sandbox egress to private IP space via networking policy"
    - Reads `architecture/security-policy.md` and `architecture/sandbox.md`
    - Identifies exact insertion points: policy field addition, SSRF check bypass path, OPA rule extension
    - Assesses: Medium complexity, High confidence, ~6 files
-3. Fetch labels — select `area:sandbox`, `area:proxy`, `area:policy`, `state:review-ready`
-4. Create issue: `feat: allow sandbox egress to private IP space via networking policy` — body includes both the summary and full investigation (code references, architecture context, alternative approaches)
-5. Report: "Created issue #59. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. Review the issue and use `build-from-issue` when ready."
+3. Write `docs/specs/SANDBOX-PRIVATE-IP-EGRESS-SPIKE.md` — contains both the summary and full investigation (code references, architecture context, alternative approaches)
+4. Report: "Wrote `docs/specs/SANDBOX-PRIVATE-IP-EGRESS-SPIKE.md`. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. Review the spike and use `build-from-issue` when ready."
 
 ### Bug investigation spike
 
@@ -275,9 +241,8 @@ User says: "The proxy retry logic seems too aggressive — I'm seeing cascading 
    - Maps the failure propagation path
    - Identifies that retries happen without backoff jitter, causing thundering herd
    - Assesses: Low complexity, High confidence, ~2 files
-3. Fetch labels — select `area:proxy`, `state:review-ready`
-4. Create issue: `fix: proxy retry logic causes cascading failures under load` — body includes both the summary and full investigation (retry code references, current behavior trace, comparison to standard backoff patterns)
-5. Report: "Created issue #74. The proxy retries without jitter or circuit breaking, which amplifies failures under load. Straightforward fix. Review and use `build-from-issue` when ready."
+3. Write `docs/specs/PROXY-RETRY-CASCADE-SPIKE.md` — contains both the summary and full investigation (retry code references, current behavior trace, comparison to standard backoff patterns)
+4. Report: "Wrote `docs/specs/PROXY-RETRY-CASCADE-SPIKE.md`. The proxy retries without jitter or circuit breaking, which amplifies failures under load. Straightforward fix. Review and use `build-from-issue` when ready."
 
 ### Performance/refactoring spike
 
@@ -291,6 +256,5 @@ User says: "Policy evaluation is getting slow — can we cache compiled OPA poli
    - Reads the policy reload/hot-swap mechanism
    - Identifies that policies are recompiled on every evaluation
    - Assesses: Medium complexity, Medium confidence (cache invalidation is a design decision), ~4 files
-3. Fetch labels — select `area:policy`, `state:review-ready`
-4. Create issue: `perf: cache compiled OPA policies to reduce evaluation latency` — body includes both the summary and full investigation (compilation hot path, per-request overhead, cache invalidation strategies with trade-offs)
-5. Report: "Created issue #81. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy — flagged as an open question. Review and use `build-from-issue` when ready."
+3. Write `docs/specs/OPA-POLICY-CACHE-SPIKE.md` — contains both the summary and full investigation (compilation hot path, per-request overhead, cache invalidation strategies with trade-offs)
+4. Report: "Wrote `docs/specs/OPA-POLICY-CACHE-SPIKE.md`. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy — flagged as an open question. Review and use `build-from-issue` when ready."
