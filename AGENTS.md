@@ -17,9 +17,9 @@ Agent skills live in `.agents/skills/`. Your harness can discover and load them 
 These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
 
 - **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
-  - Triage assesses and classifies community-filed issues. Spike investigates unknowns. Build implements.
+  - Triage assesses and classifies community-filed issues. Spike investigates unknowns and produces a spec in `docs/specs/`. Build implements from the spec.
 - **Internal development:** `create-spike` → `build-from-issue`
-  - Spike explores feasibility, then build executes once `state:agent-ready` is applied by a human.
+  - Spike explores feasibility and writes a spec to `docs/specs/`. Build reads the spec, plans, and implements after user approval.
 - **Security:** `review-security-issue` → `fix-security-issue`
   - Review produces a severity assessment and remediation plan. Fix implements it. Both require the `topic:security` label; fix also requires `state:agent-ready`.
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
@@ -50,7 +50,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
 - Org members and collaborators bypass the vouch gate automatically.
 - Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED.td`.
-- Skills that create PRs (`create-github-pr`, `build-from-issue`) should note this requirement when operating on behalf of external contributors.
+- Skills that create PRs (`create-github-pr`) should note this requirement when operating on behalf of external contributors.
 
 ## Issue and PR Conventions
 
@@ -59,7 +59,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
 - **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
 - **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
-- Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.
+- Skills that create issues or PRs (`create-github-issue`, `create-github-pr`) should produce output conforming to these templates.
 
 ## Plans
 
