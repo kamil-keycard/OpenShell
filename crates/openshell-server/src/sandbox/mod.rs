@@ -777,6 +777,71 @@ fn apply_supervisor_sideload(pod_template: &mut serde_json::Value) {
     }
 }
 
+/// Apply host bind-mount volumes declared in the policy to an already-built pod template.
+///
+/// For each `HostMount`, this injects:
+///   1. A `hostPath` volume referencing the K3s node path.
+///   2. A `volumeMount` on the agent container at the declared mount path.
+///
+/// Volume names are `host-mount-0`, `host-mount-1`, etc.
+fn apply_host_mounts(
+    pod_template: &mut serde_json::Value,
+    mounts: &[openshell_core::proto::HostMount],
+) {
+    if mounts.is_empty() {
+        return;
+    }
+
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        for (i, mount) in mounts.iter().enumerate() {
+            volumes.push(serde_json::json!({
+                "name": format!("host-mount-{i}"),
+                "hostPath": {
+                    "path": mount.host_path,
+                    "type": "Directory"
+                }
+            }));
+        }
+    }
+
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    let mut target_index = None;
+    for (i, c) in containers.iter().enumerate() {
+        if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
+            target_index = Some(i);
+            break;
+        }
+    }
+    let index = target_index.unwrap_or(0);
+
+    if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volume_mounts) = volume_mounts {
+            for (i, mount) in mounts.iter().enumerate() {
+                volume_mounts.push(serde_json::json!({
+                    "name": format!("host-mount-{i}"),
+                    "mountPath": mount.mount_path,
+                    "readOnly": mount.read_only
+                }));
+            }
+        }
+    }
+}
+
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
@@ -954,6 +1019,15 @@ fn sandbox_to_k8s_spec(
             "volumeClaimTemplates".to_string(),
             default_workspace_volume_claim_templates(),
         );
+    }
+
+    // Apply host bind mounts from the policy to the pod template.
+    if let Some(policy) = spec.and_then(|s| s.policy.as_ref()) {
+        if !policy.host_mounts.is_empty() {
+            if let Some(pod_template) = root.get_mut("podTemplate") {
+                apply_host_mounts(pod_template, &policy.host_mounts);
+            }
+        }
     }
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
