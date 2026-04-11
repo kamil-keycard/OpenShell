@@ -88,7 +88,7 @@ pub(crate) fn start_gpg_agent(
     let private_dir = Path::new(PRIVATE_DIR);
     let sandbox_gnupg_dir = Path::new(SANDBOX_GNUPG_DIR);
 
-    check_gpg_binaries()?;
+    let preset_bin = check_gpg_binaries()?;
 
     // Create private directory (root-only).
     std::fs::create_dir_all(private_dir)
@@ -170,7 +170,7 @@ pub(crate) fn start_gpg_agent(
     // Pre-seed the passphrase for every keygrip (primary + subkeys).
     let keygrips = get_all_keygrips(private_dir)?;
     for grip in &keygrips {
-        preset_passphrase(private_dir, grip, passphrase)?;
+        preset_passphrase(&preset_bin, private_dir, grip, passphrase)?;
     }
     info!(
         count = keygrips.len(),
@@ -216,21 +216,41 @@ pub(crate) fn start_gpg_agent(
     })
 }
 
-/// Verify that required GPG binaries are available.
-fn check_gpg_binaries() -> Result<()> {
-    for binary in &["gpg", "gpg-agent", "gpg-preset-passphrase"] {
+/// Verify that required GPG binaries are available and return the full
+/// path to `gpg-preset-passphrase` (which lives in the GnuPG libexecdir
+/// rather than on PATH).
+fn check_gpg_binaries() -> Result<PathBuf> {
+    for binary in &["gpg", "gpg-agent", "gpgconf"] {
         let result = Command::new("which").arg(binary).output();
         match result {
             Ok(output) if output.status.success() => {}
             _ => {
                 return Err(miette::miette!(
                     "required binary '{binary}' not found in PATH; \
-                     the sandbox image must include gpg, gpg-agent, and gpg-preset-passphrase"
+                     the sandbox image must include gnupg"
                 ));
             }
         }
     }
-    Ok(())
+
+    let libexec = Command::new("gpgconf")
+        .args(["--list-dirs", "libexecdir"])
+        .output()
+        .into_diagnostic()
+        .wrap_err("failed to query gpgconf libexecdir")?;
+
+    let libexec_dir = String::from_utf8_lossy(&libexec.stdout).trim().to_string();
+    let preset_path = PathBuf::from(&libexec_dir).join("gpg-preset-passphrase");
+
+    if !preset_path.exists() {
+        return Err(miette::miette!(
+            "gpg-preset-passphrase not found at {}; \
+             the sandbox image must include gnupg-utils",
+            preset_path.display()
+        ));
+    }
+    debug!(path = %preset_path.display(), "Found gpg-preset-passphrase");
+    Ok(preset_path)
 }
 
 /// Extract all keygrips from the keyring. Keys with signing subkeys have
@@ -270,10 +290,15 @@ fn get_all_keygrips(homedir: &Path) -> Result<Vec<String>> {
 ///
 /// Uses `GNUPGHOME` env var to locate the agent socket rather than
 /// `--homedir`, which not all gpg-preset-passphrase builds support.
-fn preset_passphrase(homedir: &Path, keygrip: &str, passphrase: &str) -> Result<()> {
+fn preset_passphrase(
+    preset_bin: &Path,
+    homedir: &Path,
+    keygrip: &str,
+    passphrase: &str,
+) -> Result<()> {
     use std::io::Write;
 
-    let mut child = Command::new("gpg-preset-passphrase")
+    let mut child = Command::new(preset_bin)
         .env("GNUPGHOME", homedir)
         .args(["--preset", keygrip])
         .stdin(std::process::Stdio::piped())
