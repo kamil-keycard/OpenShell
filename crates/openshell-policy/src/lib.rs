@@ -15,9 +15,9 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, PolicySecrets, ProcessPolicy, SandboxPolicy,
-    SecretMount as ProtoSecretMount,
+    FilesystemPolicy, GpgAgentConfig as ProtoGpgAgentConfig, L7Allow, L7QueryMatcher, L7Rule,
+    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicySecrets,
+    ProcessPolicy, SandboxPolicy, SecretMount as ProtoSecretMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,8 @@ struct PolicyFile {
     secrets: Option<SecretsDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     secret_mounts: Vec<SecretMountDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpg_agent: Option<GpgAgentDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filesystem_policy: Option<FilesystemDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,6 +61,15 @@ struct SecretMountDef {
     target_path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     mode: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GpgAgentDef {
+    private_key_urn: String,
+    passphrase_urn: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_key_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -258,6 +269,12 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
         env: s.env.into_iter().collect(),
     });
 
+    let gpg_agent = raw.gpg_agent.map(|g| ProtoGpgAgentConfig {
+        private_key_urn: g.private_key_urn,
+        passphrase_urn: g.passphrase_urn,
+        signing_key_id: g.signing_key_id,
+    });
+
     SandboxPolicy {
         version: raw.version,
         filesystem: raw.filesystem_policy.map(|fs| FilesystemPolicy {
@@ -283,6 +300,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             })
             .collect(),
         secrets,
+        gpg_agent,
     }
 }
 
@@ -405,10 +423,17 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         }
     });
 
+    let gpg_agent = policy.gpg_agent.as_ref().map(|g| GpgAgentDef {
+        private_key_urn: g.private_key_urn.clone(),
+        passphrase_urn: g.passphrase_urn.clone(),
+        signing_key_id: g.signing_key_id.clone(),
+    });
+
     PolicyFile {
         version: policy.version,
         secrets,
         secret_mounts,
+        gpg_agent,
         filesystem_policy,
         landlock,
         process,
@@ -511,6 +536,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         network_policies: HashMap::new(),
         secret_mounts: Vec::new(),
         secrets: None,
+        gpg_agent: None,
     }
 }
 
@@ -1159,6 +1185,7 @@ network_policies:
             network_policies: HashMap::new(),
             secret_mounts: Vec::new(),
             secrets: None,
+            gpg_agent: None,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -1603,5 +1630,73 @@ secret_mounts:
         assert!(proto.secrets.is_some());
         assert_eq!(proto.secret_mounts.len(), 1);
         assert!(validate_sandbox_policy(&proto).is_ok());
+    }
+
+    // ---- GPG agent tests ----
+
+    #[test]
+    fn round_trip_preserves_gpg_agent() {
+        let yaml = r#"
+version: 1
+gpg_agent:
+  private_key_urn: "urn:secret-b64:gpg-private-key"
+  passphrase_urn: "urn:secret:gpg-passphrase"
+  signing_key_id: "ABCDEF1234567890"
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let gpg = proto1.gpg_agent.as_ref().expect("gpg_agent should be present");
+        assert_eq!(gpg.private_key_urn, "urn:secret-b64:gpg-private-key");
+        assert_eq!(gpg.passphrase_urn, "urn:secret:gpg-passphrase");
+        assert_eq!(gpg.signing_key_id, "ABCDEF1234567890");
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        let gpg2 = proto2
+            .gpg_agent
+            .as_ref()
+            .expect("gpg_agent should survive round-trip");
+        assert_eq!(gpg2.private_key_urn, gpg.private_key_urn);
+        assert_eq!(gpg2.passphrase_urn, gpg.passphrase_urn);
+        assert_eq!(gpg2.signing_key_id, gpg.signing_key_id);
+    }
+
+    #[test]
+    fn round_trip_gpg_agent_without_signing_key_id() {
+        let yaml = r#"
+version: 1
+gpg_agent:
+  private_key_urn: "urn:secret-b64:gpg-private-key"
+  passphrase_urn: "urn:secret:gpg-passphrase"
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let gpg = proto1.gpg_agent.as_ref().expect("gpg_agent should be present");
+        assert!(gpg.signing_key_id.is_empty());
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        assert!(
+            !yaml_out.contains("signing_key_id"),
+            "empty signing_key_id should be omitted from YAML"
+        );
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert!(proto2.gpg_agent.is_some());
+    }
+
+    #[test]
+    fn gpg_agent_absent_parses_fine() {
+        let yaml = "version: 1\n";
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        assert!(proto.gpg_agent.is_none());
+    }
+
+    #[test]
+    fn gpg_agent_rejects_unknown_fields() {
+        let yaml = r#"
+version: 1
+gpg_agent:
+  private_key_urn: "urn:secret-b64:gpg-private-key"
+  passphrase_urn: "urn:secret:gpg-passphrase"
+  bogus_field: true
+"#;
+        assert!(parse_sandbox_policy(yaml).is_err());
     }
 }
