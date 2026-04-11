@@ -8,6 +8,7 @@
 pub mod bypass_monitor;
 mod child_env;
 pub mod denial_aggregator;
+mod gpg_agent;
 mod grpc_client;
 mod identity;
 pub mod l7;
