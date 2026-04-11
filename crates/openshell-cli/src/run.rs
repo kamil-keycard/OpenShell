@@ -2025,8 +2025,7 @@ pub async fn sandbox_create(
         .unwrap_or_default();
 
     let inferred_types: Vec<String> = {
-        let secret_keys: HashSet<&str> =
-            policy_secret_keys.iter().map(String::as_str).collect();
+        let secret_keys: HashSet<&str> = policy_secret_keys.iter().map(String::as_str).collect();
         let registry = ProviderRegistry::new();
         inferred_provider_type(command)
             .into_iter()
@@ -5252,7 +5251,10 @@ mod tests {
 
     /// Helper that replicates the secret-key filtering applied to inferred
     /// provider types in `sandbox_create`.
-    fn filter_inferred_types(command: &[String], policy_secret_keys: &HashSet<&str>) -> Vec<String> {
+    fn filter_inferred_types(
+        command: &[String],
+        policy_secret_keys: &HashSet<&str>,
+    ) -> Vec<String> {
         let registry = ProviderRegistry::new();
         inferred_provider_type(command)
             .into_iter()
