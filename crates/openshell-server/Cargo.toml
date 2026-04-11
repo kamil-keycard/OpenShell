@@ -74,6 +74,7 @@ hex = "0.4"
 russh = "0.57"
 rand = "0.9"
 petname = "2"
+base64 = { workspace = true }
 
 [features]
 dev-settings = ["openshell-core/dev-settings"]

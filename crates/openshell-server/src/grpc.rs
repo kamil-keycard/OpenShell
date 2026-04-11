@@ -207,8 +207,9 @@ impl OpenShell for OpenShellService {
             }
         }
 
-        // Sandboxes with secrets must have at least one keycard provider.
-        if !spec.secrets.is_empty() && keycard_providers.is_empty() {
+        // Sandboxes with secrets (env-var or file) must have at least one keycard provider.
+        let has_secrets = !spec.secrets.is_empty() || !spec.file_secrets.is_empty();
+        if has_secrets && keycard_providers.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox has secrets but no keycard provider attached",
             ));
@@ -1060,15 +1061,26 @@ impl OpenShell for OpenShellService {
         )
         .await?;
 
+        let file_secrets = resolve_file_secrets(
+            self.state.store.as_ref(),
+            &spec.providers,
+            &self.state.keycard_credentials,
+            &sandbox_id,
+            &spec.file_secrets,
+        )
+        .await?;
+
         info!(
             sandbox_id = %sandbox_id,
             provider_count = spec.providers.len(),
             env_count = environment.len(),
+            file_secret_count = file_secrets.len(),
             "GetSandboxProviderEnvironment request completed successfully"
         );
 
         Ok(Response::new(GetSandboxProviderEnvironmentResponse {
             environment,
+            file_secrets,
         }))
     }
 
@@ -3304,6 +3316,32 @@ fn validate_sandbox_spec(
         }
     }
 
+    // --- spec.file_secrets ---
+    validate_string_map(
+        &spec.file_secrets,
+        MAX_ENVIRONMENT_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "spec.file_secrets",
+    )?;
+    for (path, urn) in &spec.file_secrets {
+        if !path.starts_with('/') {
+            return Err(Status::invalid_argument(format!(
+                "spec.file_secrets path must be absolute: '{path}'"
+            )));
+        }
+        if path.contains("..") {
+            return Err(Status::invalid_argument(format!(
+                "spec.file_secrets path must not contain '..': '{path}'"
+            )));
+        }
+        if !urn.starts_with("urn:secret-b64:") {
+            return Err(Status::invalid_argument(format!(
+                "spec.file_secrets URN must use urn:secret-b64: prefix: '{urn}'"
+            )));
+        }
+    }
+
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
@@ -3873,6 +3911,108 @@ async fn resolve_provider_environment(
     }
 
     Ok(env)
+}
+
+const FILE_SECRET_URN_PREFIX: &str = "urn:secret-b64:";
+const MAX_FILE_SECRET_SIZE: usize = 256 * 1024; // 256KB
+
+/// Resolve file-based secrets via Keycard token exchange with base64 decoding.
+///
+/// For each file_secret entry (target_path -> urn:secret-b64:resource), strips
+/// the URN prefix, performs a token exchange, and base64-decodes the returned
+/// access_token to recover raw file bytes.
+async fn resolve_file_secrets(
+    store: &crate::persistence::Store,
+    provider_names: &[String],
+    keycard_store: &crate::keycard::KeycardCredentialStore,
+    sandbox_id: &str,
+    file_secrets: &std::collections::HashMap<String, String>,
+) -> Result<std::collections::HashMap<String, Vec<u8>>, Status> {
+    if file_secrets.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut resolved = std::collections::HashMap::new();
+
+    for name in provider_names {
+        let provider = store
+            .get_message_by_name::<Provider>(name)
+            .await
+            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+
+        if provider.r#type != openshell_providers::providers::keycard::PROVIDER_TYPE {
+            continue;
+        }
+
+        let kc_creds = keycard_store.get(sandbox_id).await.ok_or_else(|| {
+            Status::internal(format!(
+                "sandbox '{sandbox_id}' has file_secrets but no keycard credentials found"
+            ))
+        })?;
+
+        let kc_config = crate::keycard::KeycardConfig::from_provider_config(&provider.config)
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "keycard provider '{name}' missing required config keys"
+                ))
+            })?;
+
+        let kc_client = crate::keycard::KeycardClient::new(kc_config).map_err(|e| {
+            Status::internal(format!(
+                "failed to create keycard client for provider '{name}': {e}"
+            ))
+        })?;
+
+        for (target_path, urn) in file_secrets {
+            let resource_urn = urn
+                .strip_prefix(FILE_SECRET_URN_PREFIX)
+                .ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "file_secret URN must start with '{FILE_SECRET_URN_PREFIX}': '{urn}'"
+                    ))
+                })?;
+
+            let b64_content = kc_client
+                .exchange_token(&kc_creds.client_id, &kc_creds.client_secret, resource_urn)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "keycard token exchange failed for file secret at '{target_path}' \
+                         (resource '{resource_urn}'): {e}"
+                    ))
+                })?;
+
+            use base64::Engine as _;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&b64_content)
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "file secret at '{target_path}' contains invalid base64: {e}"
+                    ))
+                })?;
+
+            if decoded.is_empty() {
+                return Err(Status::internal(format!(
+                    "file secret at '{target_path}' decoded to empty content"
+                )));
+            }
+
+            if decoded.len() > MAX_FILE_SECRET_SIZE {
+                return Err(Status::invalid_argument(format!(
+                    "file secret at '{target_path}' exceeds maximum size \
+                     ({} > {MAX_FILE_SECRET_SIZE})",
+                    decoded.len()
+                )));
+            }
+
+            resolved.insert(target_path.clone(), decoded);
+        }
+
+        break;
+    }
+
+    Ok(resolved)
 }
 
 fn is_valid_env_key(key: &str) -> bool {
