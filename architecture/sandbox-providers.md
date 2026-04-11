@@ -199,9 +199,13 @@ Resolution logic (CLI side, `crates/openshell-cli/src/run.rs`):
 
 Gateway-side `create_sandbox()` (`crates/openshell-server/src/grpc.rs`):
 
-1. validates all provider names exist by fetching each from the store (fail fast),
-2. creates the `Sandbox` object with `spec.providers` set,
-3. **does not inject credentials into the pod spec** — credentials are fetched at runtime.
+1. validates policy (process identity defaults, safety checks),
+2. **extracts policy-declared secrets** via `extract_policy_secrets()` — merges
+   `secrets.env`, `secrets.provider`, and `secret_mounts` from the policy into the
+   `SandboxSpec` (see [Policy-Declared Secrets](#policy-declared-secrets) below),
+3. validates all provider names exist by fetching each from the store (fail fast),
+4. creates the `Sandbox` object with `spec.providers` set,
+5. **does not inject credentials into the pod spec** — credentials are fetched at runtime.
 
 If a requested provider name is not found, sandbox creation fails with a
 `FailedPrecondition` error.
@@ -209,6 +213,123 @@ If a requested provider name is not found, sandbox creation fails with a
 > **Note:** Providers can also be configured from within the sandbox itself. This allows
 > sandbox users to set up or update provider credentials and configuration at runtime,
 > without requiring them to be fully resolved before sandbox creation.
+
+## Policy-Declared Secrets
+
+Secret bindings (env var secrets, file secret mounts, and the Keycard provider) can be
+declared directly in the policy YAML, making the policy the single source of truth for
+sandbox configuration. When a policy declares secrets, the `--secret`, `--file-secret`,
+and `--provider` CLI flags become optional.
+
+### Policy Schema
+
+The policy YAML supports two top-level fields for secret declarations:
+
+```yaml
+version: 1
+
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+    GITHUB_TOKEN: "urn:secret:gh-token"
+
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh:private-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+
+filesystem_policy:
+  # ...
+network_policies:
+  # ...
+```
+
+The `secrets` block is defined by the `SecretsDef` serde struct in
+`crates/openshell-policy/src/lib.rs` and maps to the `PolicySecrets` proto message
+in `proto/sandbox.proto`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `secrets.provider` | `string` | Name of the Keycard provider on the gateway. Required when `env` is non-empty. Equivalent to `--provider` on the CLI. |
+| `secrets.env` | `map<string, string>` | Env var name → Keycard resource URN. Each entry becomes an environment variable in the sandbox. Equivalent to individual `--secret KEY=URN` flags. |
+
+The `secret_mounts` field uses the existing `SecretMount` proto message and
+`SecretMountDef` serde struct. Each entry is equivalent to a `--file-secret PATH=URN`
+CLI flag.
+
+### Extraction and Merge Semantics
+
+The gateway's `extract_policy_secrets()` function (`crates/openshell-server/src/grpc.rs`)
+runs during `create_sandbox()`, after policy validation but before provider validation.
+It reads the parsed `SandboxPolicy` and merges its secret declarations into `SandboxSpec`:
+
+1. **`secrets.env` → `SandboxSpec.secrets`**: Each `(key, urn)` pair is inserted via
+   `entry().or_insert()`. Because the CLI populates `SandboxSpec.secrets` first, CLI
+   values take precedence when both declare the same env var key.
+
+2. **`secrets.provider` → `SandboxSpec.providers`**: The provider name is appended to the
+   providers list if not already present. This means `--provider` on the CLI and
+   `secrets.provider` in the policy are additive — both providers are included.
+
+3. **`secret_mounts` → `SandboxSpec.file_secrets`**: Each mount's `(target_path, source_urn)`
+   pair is inserted via `entry().or_insert()`. CLI `--file-secret` flags for the same
+   target path take precedence.
+
+This extraction happens before provider validation, so policy-declared providers are
+included in the validation loop that checks provider existence on the gateway.
+
+### CLI Override Examples
+
+Policy-only creation (no CLI flags needed):
+
+```bash
+openshell sandbox create --policy policy.yaml -- claude
+```
+
+CLI override of a single secret declared in the policy:
+
+```bash
+openshell sandbox create --policy policy.yaml \
+  --secret ANTHROPIC_API_KEY=urn:secret:my-personal-key \
+  -- claude
+```
+
+The CLI-provided URN for `ANTHROPIC_API_KEY` wins over the policy's value.
+
+### Validation
+
+Policy-declared secrets are validated by `validate_sandbox_policy()` in
+`crates/openshell-policy/src/lib.rs`:
+
+- `secrets.env` keys must be valid environment variable names
+  (`^[A-Za-z_][A-Za-z0-9_]*$`).
+- `secrets.env` values must be non-empty.
+- `secrets.provider` must be non-empty when `secrets.env` has entries.
+- `secret_mounts` paths must be absolute, contain no traversal components, and respect
+  length limits.
+
+### Static Field Enforcement
+
+Both `secrets` and `secret_mounts` are static fields — they cannot be changed via
+`openshell policy set` on a running sandbox. The `validate_static_fields_unchanged()`
+function rejects any update that modifies either field. Both are resolved once at sandbox
+startup (secret resolution and file writes happen during provisioning).
+
+### OPA Data Isolation
+
+The `proto_to_opa_data_json()` function in `crates/openshell-sandbox/src/opa.rs` uses an
+allowlist approach: it constructs OPA data from `filesystem_policy`, `landlock`, `process`,
+and `network_policies` only. The `secrets` and `secret_mounts` fields are never included
+in the OPA data document, so secret URNs and provider names do not leak into Rego
+evaluation.
+
+### Policy Hashing
+
+The `deterministic_policy_hash()` function in `crates/openshell-server/src/grpc.rs`
+includes both `secrets` (provider name + sorted env entries) and `secret_mounts` in the
+SHA-256 hash. Adding, removing, or changing secret declarations produces a different hash,
+which triggers sandbox reload detection.
 
 ## Sandbox Credential Injection
 
@@ -460,6 +581,23 @@ openshell sandbox create --provider my-keycard \
   --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key
 ```
 
+Alternatively, the same configuration can be declared in the policy YAML:
+
+```yaml
+secrets:
+  provider: my-keycard
+  env:
+    ANTHROPIC_API_KEY: "urn:resource:anthropic-api-key"
+```
+
+```bash
+openshell sandbox create --policy policy.yaml
+```
+
+The gateway extracts `secrets.provider` and `secrets.env` from the policy during sandbox
+creation, so the `--provider` and `--secret` CLI flags are not required when the policy
+declares them. See [Policy-Declared Secrets](#policy-declared-secrets) for merge semantics.
+
 ### Ephemeral Credential Store
 
 The `KeycardCredentialStore` (`crates/openshell-server/src/keycard.rs`) is an in-memory
@@ -486,6 +624,11 @@ would need reprovisioning.
 
 ### End-to-End Flow
 
+Secrets can arrive via CLI flags, policy declarations, or both. The gateway merges them
+(CLI takes precedence) before proceeding with Keycard provisioning.
+
+**Path A — CLI flags only:**
+
 ```
 CLI: openshell sandbox create --provider my-keycard \
        --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key -- claude
@@ -493,28 +636,48 @@ CLI: openshell sandbox create --provider my-keycard \
   +-- SandboxSpec.providers = ["my-keycard"]
   +-- SandboxSpec.secrets = {ANTHROPIC_API_KEY: "urn:resource:anthropic-api-key"}
   +-- Sends CreateSandboxRequest to gateway
+```
+
+**Path B — Policy-declared secrets (no CLI flags):**
+
+```
+CLI: openshell sandbox create --policy policy.yaml -- claude
+  |
+  +-- SandboxSpec.policy.secrets = {provider: "my-keycard", env: {ANTHROPIC_API_KEY: ...}}
+  +-- SandboxSpec.providers = [] (empty — no --provider flag)
+  +-- SandboxSpec.secrets = {} (empty — no --secret flags)
+  +-- Sends CreateSandboxRequest to gateway
+```
+
+**Gateway processing (both paths converge):**
+
+```
+Gateway: create_sandbox()
+  +-- Validates policy, ensures process identity defaults
+  +-- extract_policy_secrets():
+  |     +-- Merges policy.secrets.env into spec.secrets (CLI values already present win)
+  |     +-- Merges policy.secrets.provider into spec.providers (if not already listed)
+  |     +-- Merges policy.secret_mounts into spec.file_secrets (CLI values win by target_path)
+  +-- Validates provider "my-keycard" exists, detects type "keycard"
+  +-- Validates secrets requires keycard provider (fail if none)
+  +-- Generates sandbox ID
+  +-- Calls Keycard API: POST /zones/{zoneId}/applications
+  |     +-- identifier: "spiffe://{zoneId}/sandbox/{sandboxId}"
+  +-- Calls Keycard API: POST /zones/{zoneId}/application-credentials
+  |     +-- Returns: {identifier: "client-id", password: "client-secret"}
+  +-- Stores in KeycardCredentialStore: sandboxId -> {client_id, client_secret, zone_id}
+  +-- Persists Sandbox with spec.secrets, creates K8s resource
         |
-        Gateway: create_sandbox()
-          +-- Validates provider "my-keycard" exists, detects type "keycard"
-          +-- Validates secrets requires keycard provider (fail if none)
-          +-- Generates sandbox ID
-          +-- Calls Keycard API: POST /zones/{zoneId}/applications
-          |     +-- identifier: "spiffe://{zoneId}/sandbox/{sandboxId}"
-          +-- Calls Keycard API: POST /zones/{zoneId}/application-credentials
-          |     +-- Returns: {identifier: "client-id", password: "client-secret"}
-          +-- Stores in KeycardCredentialStore: sandboxId -> {client_id, client_secret, zone_id}
-          +-- Persists Sandbox with spec.secrets, creates K8s resource
-                |
-                Sandbox supervisor: run_sandbox()
-                  +-- Fetches provider env via gRPC
-                  |     +-- Gateway resolves:
-                  |     |   "my-keycard" (type: keycard) -> token exchange for each secret
-                  |     |   POST https://{zoneId}.keycard.cloud/oauth/2/token
-                  |     |     BasicAuth(client-id, client-secret), resource=urn:resource:anthropic-api-key
-                  |     |   -> {ANTHROPIC_API_KEY: "sk-ant-actual-key"}
-                  |     +-- Admin creds and per-sandbox OAuth creds NEVER included
-                  +-- Builds placeholder registry + child env
-                  +-- Spawns entrypoint/SSH with ANTHROPIC_API_KEY placeholder
+        Sandbox supervisor: run_sandbox()
+          +-- Fetches provider env via gRPC
+          |     +-- Gateway resolves:
+          |     |   "my-keycard" (type: keycard) -> token exchange for each secret
+          |     |   POST https://{zoneId}.keycard.cloud/oauth/2/token
+          |     |     BasicAuth(client-id, client-secret), resource=urn:resource:anthropic-api-key
+          |     |   -> {ANTHROPIC_API_KEY: "sk-ant-actual-key"}
+          |     +-- Admin creds and per-sandbox OAuth creds NEVER included
+          +-- Builds placeholder registry + child env
+          +-- Spawns entrypoint/SSH with ANTHROPIC_API_KEY placeholder
 
 CLI: openshell sandbox delete my-sandbox
   |
@@ -536,7 +699,11 @@ The gateway enforces:
 - generated `id` on create,
 - id preservation on update,
 - `SandboxSpec.secrets` keys must be valid environment variable names,
-- sandboxes with non-empty `secrets` must have at least one Keycard provider attached.
+- sandboxes with non-empty `secrets` must have at least one Keycard provider attached,
+- policy-declared `secrets.env` keys must be valid env var names with non-empty values,
+- policy-declared `secrets.provider` must be non-empty when `secrets.env` has entries,
+- `secrets` and `secret_mounts` are static fields — rejected by
+  `validate_static_fields_unchanged()` on live policy updates.
 
 Providers are stored with `object_type = "provider"` in the shared object store.
 
@@ -579,3 +746,17 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 - sandbox unit tests validate placeholder generation and header rewriting.
 - E2E sandbox tests verify placeholders are visible in child env, outbound proxy traffic
   is rewritten with the real secret, and the SSH handshake secret is absent from exec env.
+- Policy-declared secrets tests in `crates/openshell-policy/src/lib.rs`:
+  - Round-trip fidelity: YAML with `secrets` block → proto → YAML preserves all fields.
+  - Validation rejects `secrets.env` without a provider, invalid env keys, and empty values.
+  - Validation accepts valid secrets with and without env entries (provider-only).
+  - Policies without `secrets` continue to parse (backward compatibility).
+- `extract_policy_secrets` unit tests in `crates/openshell-server/src/grpc.rs`:
+  - Policy env secrets merge into spec, CLI values take precedence on conflict.
+  - Policy provider merges into spec providers list (deduplicated).
+  - Policy `secret_mounts` merge into spec file secrets, CLI target paths take precedence.
+- Static field enforcement tests verify `validate_static_fields_unchanged()` rejects
+  changes to `secrets` and `secret_mounts` on live sandboxes.
+- OPA data isolation tests confirm `proto_to_opa_data_json()` excludes both `secrets` and
+  `secret_mounts` from OPA data.
+- Policy hashing tests confirm `deterministic_policy_hash()` includes `secrets` fields.

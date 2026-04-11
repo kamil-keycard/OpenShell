@@ -7,7 +7,7 @@ The sandbox system uses a YAML-based policy language to govern sandbox behavior.
 
 Policies serve two purposes:
 
-1. **Static configuration** -- filesystem access rules, Landlock compatibility, and process privilege dropping (applied once at sandbox startup and immutable for the sandbox's lifetime).
+1. **Static configuration** -- filesystem access rules, Landlock compatibility, process privilege dropping, and secret bindings (applied once at sandbox startup and immutable for the sandbox's lifetime).
 2. **Dynamic network decisions** -- per-connection and per-request access control evaluated at runtime by the OPA engine. These fields can be updated on a running sandbox via live policy updates.
 
 ## Policy Loading
@@ -86,7 +86,7 @@ Policy fields fall into two categories based on when they are enforced:
 
 | Category | Fields | Enforcement Point | Updatable? |
 |----------|--------|-------------------|------------|
-| **Static** | `filesystem_policy`, `landlock`, `process`, `secret_mounts` | Applied once at sandbox startup. Kernel-level Landlock rulesets, UID/GID changes, and file secret writes cannot be reversed. | No -- immutable after sandbox creation |
+| **Static** | `filesystem_policy`, `landlock`, `process`, `secrets`, `secret_mounts` | Applied once at sandbox startup. Kernel-level Landlock rulesets, UID/GID changes, credential resolution, and file secret writes cannot be reversed. | No -- immutable after sandbox creation |
 | **Dynamic** | `network_policies` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `openshell policy set` |
 
 Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/openshell-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
@@ -159,7 +159,9 @@ The hash is computed as follows:
 1. Hash the `version` field as little-endian bytes.
 2. Hash the `filesystem`, `landlock`, and `process` sub-messages via `encode_to_vec()` (these contain no `map` fields, so encoding is deterministic).
 3. Collect `network_policies` entries, sort by map key, then hash each key (as UTF-8 bytes) followed by the value's `encode_to_vec()`.
-4. Return the hex-encoded SHA-256 digest.
+4. Hash each `secret_mounts` entry via `encode_to_vec()` (repeated field, deterministic ordering).
+5. Hash `secrets.provider` as UTF-8 bytes, then collect `secrets.env` entries, sort by key, and hash each key-value pair.
+6. Return the hex-encoded SHA-256 digest.
 
 This guarantees that the same logical policy always produces the same hash regardless of protobuf serialization order.
 
@@ -279,13 +281,25 @@ See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshe
 
 ## Full YAML Policy Schema
 
-The YAML data file contains top-level keys that map directly to the OPA data namespace (`data.*`). The following sections document every field.
+The YAML data file contains top-level keys that correspond to fields on the `SandboxPolicy` protobuf message. Most fields map to the OPA data namespace (`data.*`) for runtime evaluation. The `secrets` and `secret_mounts` fields are exceptions -- they are resolved at sandbox creation and excluded from OPA data. The following sections document every field.
 
 ### Top-Level Structure
 
 ```yaml
 # Required version field
 version: 1
+
+# Env var secret bindings via Keycard (resolved at sandbox creation)
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+
+# File secret mount declarations (resolved at sandbox creation via Keycard)
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
 
 # Filesystem access policy (applied at startup via Landlock)
 filesystem_policy:
@@ -308,12 +322,6 @@ network_policies:
     name: policy_name
     endpoints: []
     binaries: []
-
-# File secret mount declarations (optional, for policy auditing)
-secret_mounts:
-  - source_urn: "urn:secret-b64:ssh-key"
-    target_path: "/sandbox/.ssh/id_ed25519"
-    mode: "0600"
 ```
 
 ---
@@ -637,9 +645,46 @@ network_policies:
 
 ---
 
+### `secrets`
+
+Declares environment variable secret bindings and the Keycard provider used to resolve them. At sandbox creation, the gateway reads `secrets.env` entries and resolves each URN via the named Keycard provider, injecting the resulting credentials as environment variables on the sandbox process. **Static field** -- secrets are resolved once at sandbox creation and cannot be changed via live policy updates (see [Static vs. Dynamic Fields](#static-vs-dynamic-fields)).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `provider` | `string` | `""` | Name of the Keycard provider used for credential resolution |
+| `env` | `map<string, string>` | `{}` | Map of environment variable name to Keycard resource URN |
+
+**Resolution flow**: At sandbox creation, `extract_policy_secrets()` merges `secrets.env` entries into `SandboxSpec.secrets` and appends `secrets.provider` to `SandboxSpec.providers`. CLI-provided values take precedence on conflict (first-write wins). The gateway then resolves each URN via the Keycard provider's `exchange_token()` and injects the resulting values as environment variables. See `crates/openshell-server/src/grpc.rs` -- `extract_policy_secrets()`.
+
+**OPA exclusion**: Both `secrets` and `secret_mounts` are excluded from the JSON data loaded into the OPA engine. Secret URNs and provider names never leak into the Rego evaluation context. See `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
+
+**Deterministic hashing**: The `secrets` field is included in the deterministic policy hash. The `provider` string is hashed directly, and `env` map entries are sorted by key before hashing to ensure consistent ordering despite the underlying `HashMap`. See `crates/openshell-server/src/grpc.rs` -- `deterministic_policy_hash()`.
+
+**Validation rules** (applied at policy load time via `validate_sandbox_policy()`):
+
+| Condition | Result |
+|---|---|
+| `env` is non-empty but `provider` is empty | Error: `InvalidSecrets` ("env secrets declared but provider is empty") |
+| `env` key is not a valid environment variable name (must start with letter or `_`, contain only `[A-Za-z0-9_]`) | Error: `InvalidSecrets` ("env key '{key}' is not a valid environment variable name") |
+| `env` value is empty | Error: `InvalidSecrets` ("env value is empty for key '{key}'") |
+
+A `provider` with an empty `env` map is valid (the provider is registered but no env var bindings are declared).
+
+See `crates/openshell-policy/src/lib.rs` -- `validate_sandbox_policy()`, `is_valid_env_key()`, `PolicyViolation::InvalidSecrets`.
+
+```yaml
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+    GITHUB_TOKEN: "urn:secret:gh-token"
+```
+
+---
+
 ### `secret_mounts`
 
-Declares file-based secrets that should be mounted into the sandbox. This field is optional and serves as a declarative audit trail in the policy YAML. The actual runtime bindings are carried separately on `SandboxSpec.file_secrets` (see `proto/datamodel.proto`). **Static field** -- file secrets are written at sandbox startup and cannot be changed via live policy updates.
+Declares file-based secrets that should be mounted into the sandbox. At sandbox creation, the gateway extracts secret mounts from the policy, resolves each `source_urn` via Keycard, and passes the resolved bytes to the sandbox supervisor as `SandboxSpec.file_secrets`. The supervisor writes each secret to disk before the sandboxed process starts. **Static field** -- file secrets are resolved and written at sandbox startup and cannot be changed via live policy updates.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -1037,6 +1082,9 @@ The following validation rules are enforced during policy loading (both file mod
 | Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
 | Host wildcard does not start with `*.` or `**.`| `host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'`        |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
+| Secrets `env` is non-empty but `provider` is empty | `invalid secrets: env secrets declared but provider is empty`                              |
+| Secrets `env` key is not a valid env var name  | `invalid secrets: env key '{key}' is not a valid environment variable name`                |
+| Secrets `env` value is empty                   | `invalid secrets: env value is empty for key '{key}'`                                      |
 | Secret mount `target_path` is empty            | `invalid secret mount: target_path is empty`                                               |
 | Secret mount `target_path` exceeds 4096 chars  | `invalid secret mount: target_path exceeds maximum length`                                 |
 | Secret mount `target_path` is not absolute     | `invalid secret mount: target_path must be absolute`                                       |
@@ -1052,6 +1100,8 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | `filesystem_policy` differs from version 1 | `filesystem policy cannot be changed on a live sandbox (applied at startup)` |
 | `landlock` differs from version 1 | `landlock policy cannot be changed on a live sandbox (applied at startup)` |
 | `process` differs from version 1 | `process policy cannot be changed on a live sandbox (applied at startup)` |
+| `secret_mounts` differs from version 1 | `secret_mounts cannot be changed on a live sandbox (applied at startup)` |
+| `secrets` differs from version 1 | `secrets cannot be changed on a live sandbox (resolved at startup)` |
 
 ### Warnings (Log Only)
 
@@ -1213,6 +1263,12 @@ This example demonstrates all policy features in a single file.
 ```yaml
 version: 1
 
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+    GITHUB_TOKEN: "urn:secret:gh-token"
+
 filesystem_policy:
   include_workdir: true
   read_only:
@@ -1362,7 +1418,7 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/python3.13 }
 
-# File secret mounts (optional -- declarative audit trail)
+# File secret mounts (resolved via Keycard at sandbox creation)
 secret_mounts:
   - source_urn: "urn:secret-b64:ssh-private-key"
     target_path: "/sandbox/.ssh/id_ed25519"
@@ -1385,6 +1441,9 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `SandboxPolicy`     | `process`                                                           | `process`                                   |
 | `SandboxPolicy`     | `network_policies`                                                  | `network_policies`                          |
 | `SandboxPolicy`     | `secret_mounts`                                                     | `secret_mounts`                             |
+| `SandboxPolicy`     | `secrets`                                                           | `secrets`                                   |
+| `PolicySecrets`     | `provider`                                                          | `secrets.provider`                          |
+| `PolicySecrets`     | `env`                                                               | `secrets.env`                               |
 | `FilesystemPolicy`  | `include_workdir`                                                   | `filesystem_policy.include_workdir`         |
 | `FilesystemPolicy`  | `read_only`                                                         | `filesystem_policy.read_only`               |
 | `FilesystemPolicy`  | `read_write`                                                        | `filesystem_policy.read_write`              |
@@ -1399,7 +1458,7 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
 | `SecretMount`       | `source_urn`, `target_path`, `mode`                                 | `secret_mounts[].source_urn`, `.target_path`, `.mode` |
 
-The conversion is performed in `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`. The `secret_mounts` mapping is handled in `crates/openshell-policy/src/lib.rs` -- `to_proto()` / `from_proto()`.
+The conversion is performed in `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`. The `secrets` and `secret_mounts` mappings are handled in `crates/openshell-policy/src/lib.rs` -- `to_proto()` / `from_proto()`.
 
 ---
 
