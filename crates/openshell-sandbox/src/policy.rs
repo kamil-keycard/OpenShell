@@ -106,12 +106,28 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
             proxy: Some(ProxyPolicy { http_addr: None }),
         };
 
+        let mut filesystem = proto
+            .filesystem
+            .map(FilesystemPolicy::from)
+            .unwrap_or_default();
+
+        // Auto-add host_mounts paths to Landlock coverage so the agent
+        // can access mounted directories without explicit filesystem_policy
+        // entries. Read-only mounts go to read_only, read-write to read_write.
+        for mount in &proto.host_mounts {
+            let path = PathBuf::from(openshell_policy::normalize_path(&mount.mount_path));
+            if mount.read_only {
+                if !filesystem.read_only.contains(&path) {
+                    filesystem.read_only.push(path);
+                }
+            } else if !filesystem.read_write.contains(&path) {
+                filesystem.read_write.push(path);
+            }
+        }
+
         Ok(Self {
             version: proto.version,
-            filesystem: proto
-                .filesystem
-                .map(FilesystemPolicy::from)
-                .unwrap_or_default(),
+            filesystem,
             network,
             landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
