@@ -1,6 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 version: 1
+
+# Keycard secret bindings — uncomment and fill in to declare secrets in the
+# policy instead of passing --secret / --provider on the CLI.
+#
+# secrets:
+#   provider: keyvengers
+#   env:
+#     ANTHROPIC_API_KEY: "urn:secret:claude-api"
+#
+# secret_mounts:
+#   - source_urn: "urn:secret-b64:ssh:private-key"
+#     target_path: "/sandbox/.ssh/id_ed25519"
+#     mode: "0600"
+
 filesystem_policy:
   include_workdir: true
   read_only:

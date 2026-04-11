@@ -155,6 +155,73 @@ openshell sandbox create \
   -- claude
 ```
 
+## Declaring Secrets in the Policy File
+
+Instead of passing `--secret`, `--file-secret`, and `--provider` on the CLI, you can declare all secret bindings in the policy YAML. This makes the policy the single source of truth for sandbox configuration.
+
+### Policy-only sandbox creation
+
+```yaml
+# policy.yaml
+version: 1
+
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh:private-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+
+filesystem_policy:
+  # ...
+network_policies:
+  # ...
+```
+
+```bash
+openshell sandbox create \
+  --name my-sandbox \
+  --policy policy.yaml \
+  -- claude
+```
+
+No `--secret`, `--file-secret`, or `--provider` flags are needed. The gateway extracts the Keycard provider, env var secrets, and file secret mounts from the policy at sandbox creation time.
+
+### Merge semantics
+
+When both the policy and CLI declare the same secret, the CLI value takes precedence. This lets you override specific secrets without editing the policy file:
+
+```bash
+# Policy declares ANTHROPIC_API_KEY, but CLI overrides it with a different URN
+openshell sandbox create \
+  --name my-sandbox \
+  --policy policy.yaml \
+  --secret ANTHROPIC_API_KEY=urn:secret:my-personal-key \
+  -- claude
+```
+
+The same precedence applies to `--file-secret` (overrides `secret_mounts` by target path) and `--provider` (added alongside the policy-declared provider if different).
+
+### secrets block reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | string | Name of the Keycard provider on the gateway. Required when `env` is non-empty. |
+| `env` | map | Env var name to Keycard resource URN. Each entry becomes an environment variable in the sandbox. |
+
+### secret_mounts reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source_urn` | string | Keycard resource URN (e.g., `urn:secret-b64:ssh:private-key`). Required. |
+| `target_path` | string | Absolute path inside the sandbox where the secret is written. Required. |
+| `mode` | string | Unix file mode (e.g., `"0600"`). Defaults to `"0600"` when empty. |
+
+Both `secrets` and `secret_mounts` are static fields: they cannot be changed via `openshell policy set` on a running sandbox. They are resolved once at sandbox startup.
+
 #### URN format
 
 File secret URNs must use the `urn:secret-b64:` prefix. The part after the prefix is the Keycard resource name:
@@ -189,7 +256,7 @@ Plain `urn:resource:` URNs are for environment variable secrets only and are rej
 
 ### "sandbox has secrets but no keycard provider attached"
 
-You passed `--secret` flags but no `--provider` pointing to a Keycard provider. Add `--provider <name>` where `<name>` is a Keycard-type provider.
+The sandbox has secrets (from CLI `--secret`/`--file-secret` flags or from `secrets`/`secret_mounts` in the policy) but no Keycard provider. Fix by either adding `secrets.provider` to the policy or passing `--provider <name>` on the CLI.
 
 ### "keycard provider missing required config keys"
 
