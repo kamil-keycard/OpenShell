@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Sandbox Architecture
 
 The sandbox binary isolates a user-specified command inside a child process with policy-driven enforcement. It combines Linux kernel mechanisms (Landlock, seccomp, network namespaces) with an application-layer HTTP CONNECT proxy to provide filesystem, syscall, and network isolation. An embedded OPA/Rego policy engine evaluates every outbound network connection against per-binary rules, and an optional L7 inspection layer examines individual HTTP requests within allowed tunnels.
@@ -33,6 +36,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
+| `child_env.rs` | Companion environment variable builders for proxy, TLS, file secret mounts (SSH, GPG) |
 | `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
 ## Startup and Orchestration
@@ -51,10 +55,13 @@ flowchart TD
     B --> C[Install rustls crypto provider]
     C --> D[run_sandbox]
     D --> E[load_policy]
-    E --> F[Fetch provider env via gRPC]
+    E --> F[Fetch provider env + file secrets via gRPC]
     F --> G[Create BinaryIdentityCache]
     G --> H[prepare_filesystem]
-    H --> I{Proxy mode?}
+    H --> H1{File secrets?}
+    H1 -- Yes --> H2[Write file secrets to disk<br/>Inject Landlock read_only paths<br/>Inject companion env vars]
+    H1 -- No --> I{Proxy mode?}
+    H2 --> I{Proxy mode?}
     I -- Yes --> J[Generate ephemeral CA + write TLS files]
     J --> K[Create network namespace]
     K --> K1[Install bypass detection rules]
@@ -84,43 +91,45 @@ flowchart TD
    - Neither present: return fatal error.
    - Output: `(SandboxPolicy, Option<Arc<OpaEngine>>)`
 
-2. **Provider environment fetching**: If sandbox ID and endpoint are available, call `grpc_client::fetch_provider_environment()` to get a `HashMap<String, String>` of credential environment variables. On failure, log a warning and continue with an empty map.
+2. **Provider environment and file secrets fetching**: If sandbox ID and endpoint are available, call `grpc_client::fetch_provider_environment()` to get a `ProviderEnvironment` containing both `env_vars: HashMap<String, String>` (credential environment variables) and `file_secrets: HashMap<String, Vec<u8>>` (resolved file secret contents keyed by target path). On failure, log a warning and continue with empty maps. See `crates/openshell-sandbox/src/grpc_client.rs` -- `ProviderEnvironment`.
 
 3. **Binary identity cache**: If OPA engine is active, create `Arc<BinaryIdentityCache::new()>` for SHA256 TOFU enforcement.
 
 4. **Filesystem preparation** (`prepare_filesystem()`): For each path in `filesystem.read_write`, create the directory if it does not exist and `chown` to the configured `run_as_user`/`run_as_group`. Runs as the supervisor (root) before forking.
 
-5. **TLS state for L7 inspection** (proxy mode only):
+5. **File secret writing** (if file secrets are present): Write resolved file secrets to disk, inject Landlock paths, and set companion env vars. See [File Secret Mounts](#file-secret-mounts) for details.
+
+6. **TLS state for L7 inspection** (proxy mode only):
    - Generate ephemeral CA via `SandboxCa::generate()` using `rcgen`
    - Write CA cert PEM and combined bundle (system CAs + sandbox CA) to `/etc/openshell-tls/`
    - Add the TLS directory to `policy.filesystem.read_only` so Landlock allows the child to read it
    - Build upstream `ClientConfig` with Mozilla root CAs via `webpki_roots`
    - Create `Arc<ProxyTlsState>` wrapping a `CertCache` and the upstream config
 
-6. **Network namespace** (Linux, proxy mode only):
+7. **Network namespace** (Linux, proxy mode only):
    - `NetworkNamespace::create()` builds the veth pair and namespace
    - Opens `/var/run/netns/sandbox-{uuid}` as an FD for later `setns()`
    - `install_bypass_rules(proxy_port)` installs iptables OUTPUT chain rules for bypass detection (fast-fail UX + diagnostic logging). See [Bypass detection](#bypass-detection).
    - On failure: return a fatal startup error (fail-closed). Bypass rule failure is non-fatal (logged as warning).
 
-7. **Proxy startup** (proxy mode only):
+8. **Proxy startup** (proxy mode only):
    - Validate that OPA engine and identity cache are present
    - Determine bind address: on Linux, use the netns veth host IP (netns creation is required and startup already aborted if it failed); on non-Linux, use `policy.network.proxy.http_addr`
    - Build `InferenceContext` via `build_inference_context()` which resolves routes from one of two sources (see [Inference routing context](#inference-routing-context) below)
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
 
-8. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
+9. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
 
-9. **Child process spawning** (`ProcessHandle::spawn()`):
-   - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
-   - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
-   - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
+10. **Child process spawning** (`ProcessHandle::spawn()`):
+    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
+    - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
+    - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
-10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
+11. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+12. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
 
-12. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
+13. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
@@ -1374,6 +1383,105 @@ The sandbox supervisor registers a `SIGCHLD` handler at startup and spawns a bac
 
 This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECHILD` races with explicit `child.wait()` calls on managed children while still collecting orphan zombies. The `MANAGED_CHILDREN` set is updated via `register_managed_child()` (at spawn) and `unregister_managed_child()` (after wait completes). This feature is Linux-only (`#[cfg(target_os = "linux")]`).
 
+## File Secret Mounts
+
+File-based secrets (SSH private keys, GPG keyrings) can be mounted into a sandbox at specific filesystem paths with secure permissions. This complements the existing env-var secret injection pipeline, which handles API keys via proxy-time header rewriting.
+
+### End-to-End Flow
+
+```mermaid
+sequenceDiagram
+    participant CLI as openshell sandbox run
+    participant GW as Gateway (openshell-server)
+    participant KC as Keycard
+    participant SB as Sandbox Supervisor
+
+    CLI->>GW: CreateSandbox(file_secrets: {path: urn})
+    GW->>GW: Validate: absolute path, no traversal, urn:secret-b64: prefix
+
+    Note over SB: Sandbox starts, calls GetSandboxProviderEnvironment
+    SB->>GW: GetSandboxProviderEnvironment(sandbox_id)
+    loop Each file secret entry
+        GW->>KC: exchange_token(resource_urn)
+        KC-->>GW: access_token (base64-encoded content)
+        GW->>GW: Base64-decode access_token, enforce 256KB limit
+    end
+    GW-->>SB: GetSandboxProviderEnvironmentResponse(env_vars, file_secrets)
+
+    Note over SB: Before Landlock enforcement
+    SB->>SB: write_file_secrets(): write to disk, 0600, chown sandbox:sandbox
+    SB->>SB: Inject paths into Landlock read_only
+    SB->>SB: Inject companion env vars (GIT_SSH_COMMAND, GNUPGHOME)
+    SB->>SB: Apply Landlock, seccomp, exec child
+```
+
+### CLI Usage
+
+The `--file-secret` flag binds a target path to a Keycard resource URN:
+
+```bash
+openshell sandbox run \
+  --provider my-keycard-provider \
+  --file-secret /sandbox/.ssh/id_ed25519=urn:secret-b64:ssh-private-key \
+  --file-secret /sandbox/.gnupg/pubring.kbx=urn:secret-b64:gpg-keyring \
+  -- /bin/bash
+```
+
+The URN must use the `urn:secret-b64:` prefix. The secret content is stored base64-encoded in Keycard and decoded by the gateway during resolution. A Keycard provider must be attached to the sandbox.
+
+### Gateway Resolution
+
+The gateway resolves file secrets in `resolve_file_secrets()` (see `crates/openshell-server/src/grpc.rs`):
+
+1. For each entry in `SandboxSpec.file_secrets` (key: target path, value: URN), strip the `urn:secret-b64:` prefix to get the Keycard resource URN.
+2. Call `exchange_token()` via the existing Keycard HTTP client -- the returned `access_token` carries base64-encoded file content.
+3. Base64-decode the `access_token` to recover raw bytes.
+4. Enforce a 256KB maximum decoded size per file (`MAX_FILE_SECRET_SIZE`).
+5. Return the resolved `HashMap<String, Vec<u8>>` (target path -> raw bytes) in `GetSandboxProviderEnvironmentResponse.file_secrets`.
+
+The proto field on the response is `map<string, bytes> file_secrets = 2` (see `proto/openshell.proto`).
+
+### Supervisor File Writing
+
+The sandbox supervisor writes file secrets during startup via `write_file_secrets()` in `crates/openshell-sandbox/src/lib.rs`. This runs after `prepare_filesystem()` and before Landlock enforcement.
+
+For each file secret:
+
+1. **Symlink check**: Reject the target path if it is a symlink (TOCTOU-safe because no child process is running yet).
+2. **Parent directory creation**: `create_dir_all()` for the parent, then `chown()` to the sandbox user/group.
+3. **Write content**: `std::fs::write()` the raw bytes to the target path.
+4. **Set permissions**: `chmod 0600` (owner read/write only).
+5. **Set ownership**: `chown()` to the policy's `run_as_user`/`run_as_group`.
+
+### Landlock Integration
+
+After writing, each file secret's target path is appended to `policy.filesystem.read_only` so the Landlock ruleset grants the sandboxed process read access. This injection happens in the same startup phase, before `sandbox::apply()` is called in the child's pre-exec closure.
+
+### Companion Environment Variables
+
+For well-known path patterns, the supervisor automatically injects environment variables so tools discover the mounted secrets without user configuration. See `crates/openshell-sandbox/src/child_env.rs`.
+
+| Path pattern | Env var | Value | Purpose |
+|---|---|---|---|
+| Contains `.ssh` | `GIT_SSH_COMMAND` | `ssh -i <path> -o IdentitiesOnly=yes -o StrictHostKeyChecking=no` | Git uses the mounted SSH key |
+| Contains `.gnupg` | `GNUPGHOME` | Parent directory of the mounted file | GPG finds the keyring |
+
+Companion env vars use `entry().or_insert()` so they do not override values already set by the provider environment.
+
+### Proto and Data Model
+
+| Layer | Location | Field |
+|---|---|---|
+| Sandbox spec | `proto/datamodel.proto` -- `SandboxSpec` | `map<string, string> file_secrets = 11` |
+| Policy YAML | `crates/openshell-policy/src/lib.rs` -- `PolicyFile` | `secret_mounts: Vec<SecretMountDef>` |
+| Policy proto | `proto/sandbox.proto` -- `SandboxPolicy` | `repeated SecretMount secret_mounts = 6` |
+| gRPC response | `proto/openshell.proto` -- `GetSandboxProviderEnvironmentResponse` | `map<string, bytes> file_secrets = 2` |
+| gRPC client | `crates/openshell-sandbox/src/grpc_client.rs` -- `ProviderEnvironment` | `file_secrets: HashMap<String, Vec<u8>>` |
+
+`SandboxSpec.file_secrets` carries the runtime bindings (path -> URN). `SandboxPolicy.secret_mounts` carries the declarative audit trail in the policy YAML. Both are validated independently -- the spec at sandbox creation time, the policy at load time.
+
+---
+
 ## Environment Variables Reference
 
 ### Configuration (CLI flags / env vars)
@@ -1406,6 +1514,8 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 | `REQUESTS_CA_BUNDLE` | Combined CA bundle path (Python requests) |
 | `CURL_CA_BUNDLE` | Combined CA bundle path (curl/libcurl) |
 | Provider credentials | From `GetSandboxProviderEnvironment` RPC (e.g., `ANTHROPIC_API_KEY`) |
+| `GIT_SSH_COMMAND` | SSH command pointing to mounted key (set when file secret path contains `.ssh`) |
+| `GNUPGHOME` | GPG home directory (set when file secret path contains `.gnupg`) |
 
 ### Injected into SSH child process (additional)
 

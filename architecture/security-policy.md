@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Policy Language
 
 The sandbox system uses a YAML-based policy language to govern sandbox behavior. This document is the definitive reference for the policy schema, how each field maps to enforcement mechanisms, and the behavioral triggers that control which enforcement layer is activated.
@@ -83,7 +86,7 @@ Policy fields fall into two categories based on when they are enforced:
 
 | Category | Fields | Enforcement Point | Updatable? |
 |----------|--------|-------------------|------------|
-| **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
+| **Static** | `filesystem_policy`, `landlock`, `process`, `secret_mounts` | Applied once at sandbox startup. Kernel-level Landlock rulesets, UID/GID changes, and file secret writes cannot be reversed. | No -- immutable after sandbox creation |
 | **Dynamic** | `network_policies` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `openshell policy set` |
 
 Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/openshell-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
@@ -306,6 +309,11 @@ network_policies:
     endpoints: []
     binaries: []
 
+# File secret mount declarations (optional, for policy auditing)
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
 ```
 
 ---
@@ -625,6 +633,41 @@ network_policies:
         allowed_ips: ["10.0.0.0/8"]
     binaries:
       - { path: /usr/bin/curl }
+```
+
+---
+
+### `secret_mounts`
+
+Declares file-based secrets that should be mounted into the sandbox. This field is optional and serves as a declarative audit trail in the policy YAML. The actual runtime bindings are carried separately on `SandboxSpec.file_secrets` (see `proto/datamodel.proto`). **Static field** -- file secrets are written at sandbox startup and cannot be changed via live policy updates.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `source_urn` | `string` | Yes | Keycard resource URN with `urn:secret-b64:` prefix |
+| `target_path` | `string` | Yes | Absolute filesystem path where the secret is written |
+| `mode` | `string` | No | Unix file mode (e.g., `"0600"`). Defaults to `"0600"` if empty. |
+
+**Enforcement**: The sandbox supervisor writes each secret to its `target_path` with the specified mode and `sandbox:sandbox` ownership before Landlock enforcement. Each `target_path` is auto-added to `filesystem_policy.read_only` so the sandboxed process can read the mounted secrets. Companion environment variables (`GIT_SSH_COMMAND` for `.ssh` paths, `GNUPGHOME` for `.gnupg` paths) are injected so tools discover the keys automatically.
+
+**Validation rules** (applied at policy load time via `validate_sandbox_policy()`):
+
+| Condition | Result |
+|---|---|
+| `target_path` is empty | Error: `InvalidSecretMount` |
+| `target_path` exceeds 4096 characters | Error: `InvalidSecretMount` |
+| `target_path` is not absolute (does not start with `/`) | Error: `InvalidSecretMount` |
+| `target_path` contains `..` traversal component | Error: `InvalidSecretMount` |
+| `source_urn` is empty | Error: `InvalidSecretMount` |
+
+See `crates/openshell-policy/src/lib.rs` -- `validate_sandbox_policy()`, `PolicyViolation::InvalidSecretMount`.
+
+```yaml
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-private-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+  - source_urn: "urn:secret-b64:gpg-keyring"
+    target_path: "/sandbox/.gnupg/pubring.kbx"
 ```
 
 ---
@@ -994,6 +1037,11 @@ The following validation rules are enforced during policy loading (both file mod
 | Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
 | Host wildcard does not start with `*.` or `**.`| `host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'`        |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
+| Secret mount `target_path` is empty            | `invalid secret mount: target_path is empty`                                               |
+| Secret mount `target_path` exceeds 4096 chars  | `invalid secret mount: target_path exceeds maximum length`                                 |
+| Secret mount `target_path` is not absolute     | `invalid secret mount: target_path must be absolute`                                       |
+| Secret mount `target_path` contains `..`       | `invalid secret mount: target_path contains '..' traversal component`                      |
+| Secret mount `source_urn` is empty             | `invalid secret mount: source_urn is empty for mount at '{path}'`                          |
 
 ### Errors (Live Update Rejection)
 
@@ -1314,6 +1362,14 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/python3.13 }
 
+# File secret mounts (optional -- declarative audit trail)
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-private-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+  - source_urn: "urn:secret-b64:gpg-keyring"
+    target_path: "/sandbox/.gnupg/pubring.kbx"
+
 ```
 
 ---
@@ -1328,6 +1384,7 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `SandboxPolicy`     | `landlock`                                                          | `landlock`                                  |
 | `SandboxPolicy`     | `process`                                                           | `process`                                   |
 | `SandboxPolicy`     | `network_policies`                                                  | `network_policies`                          |
+| `SandboxPolicy`     | `secret_mounts`                                                     | `secret_mounts`                             |
 | `FilesystemPolicy`  | `include_workdir`                                                   | `filesystem_policy.include_workdir`         |
 | `FilesystemPolicy`  | `read_only`                                                         | `filesystem_policy.read_only`               |
 | `FilesystemPolicy`  | `read_write`                                                        | `filesystem_policy.read_write`              |
@@ -1340,8 +1397,9 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `NetworkEndpoint`   | `host`, `port`, `ports`, `protocol`, `tls`, `enforcement`, `access`, `rules`, `allowed_ips` | Same field names. `port`/`ports` normalized during loading (see [Multi-Port Endpoints](#multi-port-endpoints)). |
 | `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
+| `SecretMount`       | `source_urn`, `target_path`, `mode`                                 | `secret_mounts[].source_urn`, `.target_path`, `.mode` |
 
-The conversion is performed in `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
+The conversion is performed in `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`. The `secret_mounts` mapping is handled in `crates/openshell-policy/src/lib.rs` -- `to_proto()` / `from_proto()`.
 
 ---
 

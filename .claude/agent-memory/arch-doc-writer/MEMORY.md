@@ -87,7 +87,7 @@
 - Poll loop: `run_policy_poll_loop()` in lib.rs, spawned after child process, gRPC mode only
 - `OpaEngine::reload_from_proto()`: reuses `from_proto()` pipeline, atomically swaps inner engine, LKG on failure
 - `CachedOpenShellClient` in grpc_client.rs: persistent mTLS channel for poll + status report (mirrors CachedInferenceClient)
-- Dynamic domains: network_policies only (inference removed from policy). Static domains: filesystem, landlock, process (pre_exec, immutable)
+- Dynamic domains: network_policies only (inference removed from policy). Static domains: filesystem, landlock, process, secret_mounts (pre_exec/startup, immutable)
 - Server-side: `UpdateSandboxPolicy` RPC rejects changes to static fields or network mode changes
 - Server-side validation: `validate_static_fields_unchanged()` + `validate_network_mode_unchanged()` in grpc.rs
 - Poll interval: `OPENSHELL_POLICY_POLL_INTERVAL_SECS` env var (default 30), no CLI flag
@@ -111,9 +111,22 @@
 - Standalone `proxy_inference()` was removed; inference handled in-sandbox by openshell-router
 - Provider types: claude, codex, opencode, generic, openai, anthropic, nvidia, gitlab, github, outlook
 
+## File Secret Mounts
+- CLI: `--file-secret PATH=URN` flag on sandbox run (main.rs ~1153)
+- Proto: `SandboxSpec.file_secrets` (map<string,string>, field 11 in datamodel.proto) + `SandboxPolicy.secret_mounts` (repeated SecretMount, field 6 in sandbox.proto)
+- Proto response: `GetSandboxProviderEnvironmentResponse.file_secrets` (map<string,bytes>, field 2 in openshell.proto)
+- Policy YAML: `secret_mounts` list with `SecretMountDef` {source_urn, target_path, mode} in PolicyFile
+- Gateway: `resolve_file_secrets()` in grpc.rs -- strips `urn:secret-b64:` prefix, exchange_token(), base64-decode, 256KB max
+- Sandbox: `write_file_secrets()` in lib.rs -- 0600 perms, sandbox:sandbox ownership, symlink rejection, parent dir creation
+- Landlock: file secret paths auto-injected into `read_only` before Landlock apply
+- Companion env vars: `child_env.rs` -- `ssh_env_vars()` (GIT_SSH_COMMAND) for .ssh paths, `gpg_env_vars()` (GNUPGHOME) for .gnupg paths
+- grpc_client.rs: `ProviderEnvironment` struct has both `env_vars` and `file_secrets` fields
+- Static field: secret_mounts cannot be changed via live policy updates
+- Validation: absolute paths, no traversal, non-empty URNs, max 4096 char paths (in validate_sandbox_policy)
+
 ## Policy System Details
-- YAML data file top-level keys: filesystem_policy, landlock, process, network_policies (NO inference key -- removed)
-- Proto SandboxPolicy fields: version, filesystem, landlock, process, network_policies (NO inference field)
+- YAML data file top-level keys: filesystem_policy, landlock, process, network_policies, secret_mounts
+- Proto SandboxPolicy fields: version, filesystem, landlock, process, network_policies, secret_mounts (NO inference field)
 - Proto message field `filesystem` maps to YAML key `filesystem_policy` (different names!)
 - IMPORTANT: Sandbox always runs in Proxy mode. NetworkMode::Block exists as enum variant but is NEVER set.
 - Both file mode and gRPC mode set NetworkMode::Proxy unconditionally (see load_policy() in lib.rs and TryFrom in policy.rs)
