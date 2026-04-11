@@ -230,8 +230,8 @@ pub async fn run_sandbox(
     // well-known path patterns so tools discover the keys automatically.
     #[cfg(unix)]
     if !file_secrets.is_empty() {
-        write_file_secrets(&file_secrets, &policy)?;
-        for target_path in file_secrets.keys() {
+        let written = write_file_secrets(&file_secrets, &policy);
+        for target_path in &written {
             let path_buf = std::path::PathBuf::from(target_path);
 
             if target_path.contains(".ssh") {
@@ -251,8 +251,9 @@ pub async fn run_sandbox(
             }
         }
         info!(
-            file_secret_count = file_secrets.len(),
-            "File secrets written and Landlock paths injected"
+            requested = file_secrets.len(),
+            mounted = written.len(),
+            "File secrets processed"
         );
     }
 
@@ -1486,12 +1487,13 @@ fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 ///
 /// Each secret is written to its `target_path` with `0600` mode and
 /// `sandbox:sandbox` ownership. Parent directories are created as needed.
-/// Must be called BEFORE Landlock enforcement.
+/// Must be called BEFORE Landlock enforcement. Returns the set of target paths
+/// that were successfully written; failed mounts are logged and skipped.
 #[cfg(unix)]
 fn write_file_secrets(
     file_secrets: &std::collections::HashMap<String, Vec<u8>>,
     policy: &SandboxPolicy,
-) -> Result<()> {
+) -> std::collections::HashSet<String> {
     use nix::unistd::{Group, User, chown};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1509,37 +1511,53 @@ fn write_file_secrets(
         .and_then(|name| Group::from_name(name).ok().flatten())
         .map(|g| g.gid);
 
+    let mut written = std::collections::HashSet::new();
+
     for (target_path, content) in file_secrets {
         let path = std::path::Path::new(target_path);
 
-        // Reject symlinks at the target path (TOCTOU-safe: no child running yet).
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
-                return Err(miette::miette!(
-                    "file secret target '{}' is a symlink — refusing to write \
-                     (potential privilege escalation)",
-                    path.display()
-                ));
+                warn!(
+                    path = %path.display(),
+                    "file secret target is a symlink, skipping (potential privilege escalation)"
+                );
+                continue;
             }
         }
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).into_diagnostic()?;
-            chown(parent, uid, gid).into_diagnostic()?;
+        let write_result = (|| -> miette::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).into_diagnostic()?;
+                chown(parent, uid, gid).into_diagnostic()?;
+            }
+            std::fs::write(path, content).into_diagnostic()?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .into_diagnostic()?;
+            chown(path, uid, gid).into_diagnostic()?;
+            Ok(())
+        })();
+
+        match write_result {
+            Ok(()) => {
+                debug!(
+                    path = %path.display(),
+                    size = content.len(),
+                    "Wrote file secret"
+                );
+                written.insert(target_path.clone());
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to write file secret, skipping"
+                );
+            }
         }
-
-        std::fs::write(path, content).into_diagnostic()?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).into_diagnostic()?;
-        chown(path, uid, gid).into_diagnostic()?;
-
-        debug!(
-            path = %path.display(),
-            size = content.len(),
-            "Wrote file secret"
-        );
     }
 
-    Ok(())
+    written
 }
 
 /// Background loop that polls the server for policy updates.

@@ -3918,9 +3918,10 @@ const MAX_FILE_SECRET_SIZE: usize = 256 * 1024; // 256KB
 
 /// Resolve file-based secrets via Keycard token exchange with base64 decoding.
 ///
-/// For each file_secret entry (target_path -> urn:secret-b64:resource), strips
-/// the URN prefix, performs a token exchange, and base64-decodes the returned
-/// access_token to recover raw file bytes.
+/// For each file_secret entry (target_path -> urn:secret-b64:resource), passes
+/// the full URN to Keycard token exchange, then base64-decodes the returned
+/// access_token to recover raw file bytes. Individual failures are logged and
+/// skipped so that one broken secret does not block the rest.
 async fn resolve_file_secrets(
     store: &crate::persistence::Store,
     provider_names: &[String],
@@ -3965,43 +3966,64 @@ async fn resolve_file_secrets(
         })?;
 
         for (target_path, urn) in file_secrets {
-            let resource_urn = urn.strip_prefix(FILE_SECRET_URN_PREFIX).ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "file_secret URN must start with '{FILE_SECRET_URN_PREFIX}': '{urn}'"
-                ))
-            })?;
+            if !urn.starts_with(FILE_SECRET_URN_PREFIX) {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    target_path = %target_path,
+                    urn = %urn,
+                    "skipping file secret with invalid URN prefix"
+                );
+                continue;
+            }
 
-            let b64_content = kc_client
-                .exchange_token(&kc_creds.client_id, &kc_creds.client_secret, resource_urn)
+            let b64_content = match kc_client
+                .exchange_token(&kc_creds.client_id, &kc_creds.client_secret, urn)
                 .await
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "keycard token exchange failed for file secret at '{target_path}' \
-                         (resource '{resource_urn}'): {e}"
-                    ))
-                })?;
+            {
+                Ok(content) => content,
+                Err(e) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        target_path = %target_path,
+                        error = %e,
+                        "keycard token exchange failed for file secret, skipping"
+                    );
+                    continue;
+                }
+            };
 
             use base64::Engine as _;
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&b64_content)
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "file secret at '{target_path}' contains invalid base64: {e}"
-                    ))
-                })?;
+            let decoded = match base64::engine::general_purpose::STANDARD.decode(&b64_content) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        target_path = %target_path,
+                        error = %e,
+                        "file secret contains invalid base64, skipping"
+                    );
+                    continue;
+                }
+            };
 
             if decoded.is_empty() {
-                return Err(Status::internal(format!(
-                    "file secret at '{target_path}' decoded to empty content"
-                )));
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    target_path = %target_path,
+                    "file secret decoded to empty content, skipping"
+                );
+                continue;
             }
 
             if decoded.len() > MAX_FILE_SECRET_SIZE {
-                return Err(Status::invalid_argument(format!(
-                    "file secret at '{target_path}' exceeds maximum size \
-                     ({} > {MAX_FILE_SECRET_SIZE})",
-                    decoded.len()
-                )));
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    target_path = %target_path,
+                    size = decoded.len(),
+                    max = MAX_FILE_SECRET_SIZE,
+                    "file secret exceeds maximum size, skipping"
+                );
+                continue;
             }
 
             resolved.insert(target_path.clone(), decoded);
