@@ -17,6 +17,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, L7Allow, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    SecretMount as ProtoSecretMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,17 @@ struct PolicyFile {
     process: Option<ProcessDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secret_mounts: Vec<SecretMountDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretMountDef {
+    source_urn: String,
+    target_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -245,6 +257,15 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             run_as_group: p.run_as_group,
         }),
         network_policies,
+        secret_mounts: raw
+            .secret_mounts
+            .into_iter()
+            .map(|sm| ProtoSecretMount {
+                source_urn: sm.source_urn,
+                target_path: sm.target_path,
+                mode: sm.mode,
+            })
+            .collect(),
     }
 }
 
@@ -346,12 +367,23 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         })
         .collect();
 
+    let secret_mounts = policy
+        .secret_mounts
+        .iter()
+        .map(|sm| SecretMountDef {
+            source_urn: sm.source_urn.clone(),
+            target_path: sm.target_path.clone(),
+            mode: sm.mode.clone(),
+        })
+        .collect();
+
     PolicyFile {
         version: policy.version,
         filesystem_policy,
         landlock,
         process,
         network_policies,
+        secret_mounts,
     }
 }
 
@@ -448,6 +480,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
             run_as_group: "sandbox".into(),
         }),
         network_policies: HashMap::new(),
+        secret_mounts: Vec::new(),
     }
 }
 
@@ -493,6 +526,8 @@ pub enum PolicyViolation {
     FieldTooLong { path: String, length: usize },
     /// Too many filesystem paths in the policy.
     TooManyPaths { count: usize },
+    /// A secret mount path is invalid.
+    InvalidSecretMount { reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -521,6 +556,9 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
                 )
+            }
+            Self::InvalidSecretMount { reason } => {
+                write!(f, "invalid secret mount: {reason}")
             }
         }
     }
@@ -605,6 +643,53 @@ pub fn validate_sandbox_policy(
                     path: path_str.clone(),
                 });
             }
+        }
+    }
+
+    for mount in &policy.secret_mounts {
+        if mount.target_path.is_empty() {
+            violations.push(PolicyViolation::InvalidSecretMount {
+                reason: "target_path is empty".to_string(),
+            });
+            continue;
+        }
+        if mount.target_path.len() > MAX_PATH_LENGTH {
+            violations.push(PolicyViolation::InvalidSecretMount {
+                reason: format!(
+                    "target_path exceeds maximum length ({} > {MAX_PATH_LENGTH}): {}",
+                    mount.target_path.len(),
+                    truncate_for_display(&mount.target_path)
+                ),
+            });
+            continue;
+        }
+        let path = Path::new(&mount.target_path);
+        if !path.has_root() {
+            violations.push(PolicyViolation::InvalidSecretMount {
+                reason: format!(
+                    "target_path must be absolute (start with '/'): {}",
+                    mount.target_path
+                ),
+            });
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::InvalidSecretMount {
+                reason: format!(
+                    "target_path contains '..' traversal component: {}",
+                    mount.target_path
+                ),
+            });
+        }
+        if mount.source_urn.is_empty() {
+            violations.push(PolicyViolation::InvalidSecretMount {
+                reason: format!(
+                    "source_urn is empty for mount at '{}'",
+                    mount.target_path
+                ),
+            });
         }
     }
 
