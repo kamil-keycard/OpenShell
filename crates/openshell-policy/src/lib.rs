@@ -586,7 +586,7 @@ pub enum PolicyViolation {
     InvalidSecretMount { reason: String },
     /// A secrets block field is invalid.
     InvalidSecrets { reason: String },
-    /// A gpg_agent block field is invalid.
+    /// A `gpg_agent` block field is invalid.
     InvalidGpgAgent { reason: String },
 }
 
@@ -1784,7 +1784,10 @@ gpg_agent:
   signing_key_id: "ABCDEF1234567890"
 "#;
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
-        let gpg = proto1.gpg_agent.as_ref().expect("gpg_agent should be present");
+        let gpg = proto1
+            .gpg_agent
+            .as_ref()
+            .expect("gpg_agent should be present");
         assert_eq!(gpg.private_key_urn, "urn:secret-b64:gpg-private-key");
         assert_eq!(gpg.passphrase_urn, "urn:secret:gpg-passphrase");
         assert_eq!(gpg.signing_key_id, "ABCDEF1234567890");
@@ -1809,7 +1812,10 @@ gpg_agent:
   passphrase_urn: "urn:secret:gpg-passphrase"
 "#;
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
-        let gpg = proto1.gpg_agent.as_ref().expect("gpg_agent should be present");
+        let gpg = proto1
+            .gpg_agent
+            .as_ref()
+            .expect("gpg_agent should be present");
         assert!(gpg.signing_key_id.is_empty());
 
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");

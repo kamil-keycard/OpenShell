@@ -40,7 +40,8 @@ impl GpgAgentHandle {
         &self.sandbox_gnupg_dir
     }
 
-    /// Return the PID of the gpg-agent process.
+    /// Return the PID of the gpg-agent process (used on Linux for SIGCHLD reaper).
+    #[allow(dead_code)]
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -107,11 +108,9 @@ pub(crate) fn start_gpg_agent(
         .into_diagnostic()?;
 
     // Write gpg-agent.conf to private dir.
-    let agent_conf = format!(
-        "default-cache-ttl 31536000\n\
+    let agent_conf = "default-cache-ttl 31536000\n\
          max-cache-ttl 31536000\n\
-         allow-preset-passphrase\n"
-    );
+         allow-preset-passphrase\n";
     std::fs::write(private_dir.join("gpg-agent.conf"), agent_conf)
         .into_diagnostic()
         .wrap_err("failed to write gpg-agent.conf")?;
@@ -180,8 +179,8 @@ pub(crate) fn start_gpg_agent(
 
     // Write gpg.conf that redirects agent to the socket in private dir.
     let socket_path = private_dir.join(SOCKET_NAME);
-    let gpg_conf = format!("no-autostart\n");
-    std::fs::write(sandbox_gnupg_dir.join("gpg.conf"), &gpg_conf)
+    let gpg_conf = "no-autostart\n";
+    std::fs::write(sandbox_gnupg_dir.join("gpg.conf"), gpg_conf)
         .into_diagnostic()
         .wrap_err("failed to write gpg.conf")?;
     chown(
@@ -202,10 +201,8 @@ pub(crate) fn start_gpg_agent(
     // Symlink ownership doesn't matter on Linux (Landlock checks the target).
 
     // Write gitconfig if signing_key_id is set.
-    if let Some(key_id) = signing_key_id {
-        if !key_id.is_empty() {
-            write_gitconfig_signing(key_id, sandbox_uid, sandbox_gid)?;
-        }
+    if let Some(key_id) = signing_key_id.filter(|k| !k.is_empty()) {
+        write_gitconfig_signing(key_id, sandbox_uid, sandbox_gid)?;
     }
 
     // Read the agent PID from the socket directory.
@@ -300,7 +297,9 @@ fn preset_passphrase(homedir: &Path, keygrip: &str, passphrase: &str) -> Result<
         .wrap_err("gpg-preset-passphrase failed")?;
 
     if !status.success() {
-        return Err(miette::miette!("gpg-preset-passphrase exited with {status}"));
+        return Err(miette::miette!(
+            "gpg-preset-passphrase exited with {status}"
+        ));
     }
     Ok(())
 }
