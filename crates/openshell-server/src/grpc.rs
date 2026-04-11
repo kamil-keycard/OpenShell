@@ -2933,6 +2933,9 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
             hasher.update(value.as_bytes());
         }
     }
+    if let Some(ref gpg) = policy.gpg_agent {
+        hasher.update(gpg.encode_to_vec());
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -3550,6 +3553,11 @@ fn validate_static_fields_unchanged(
             "secrets cannot be changed on a live sandbox (resolved at startup)",
         ));
     }
+    if baseline.gpg_agent != new.gpg_agent {
+        return Err(Status::invalid_argument(
+            "gpg_agent cannot be changed on a live sandbox (applied at startup)",
+        ));
+    }
     Ok(())
 }
 
@@ -3573,6 +3581,17 @@ fn extract_policy_secrets(spec: &mut openshell_core::proto::SandboxSpec) {
     for mount in &policy.secret_mounts {
         spec.file_secrets
             .insert(mount.target_path.clone(), mount.source_urn.clone());
+    }
+
+    if let Some(ref gpg) = policy.gpg_agent {
+        spec.file_secrets.insert(
+            "/var/lib/openshell/gpg/private-key.asc".to_string(),
+            gpg.private_key_urn.clone(),
+        );
+        spec.secrets.insert(
+            "__OPENSHELL_GPG_PASSPHRASE".to_string(),
+            gpg.passphrase_urn.clone(),
+        );
     }
 }
 
