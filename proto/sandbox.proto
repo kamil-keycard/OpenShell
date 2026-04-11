@@ -25,6 +25,21 @@ message SandboxPolicy {
   // When present, the supervisor spawns a gpg-agent daemon with the private key
   // loaded in a root-only directory, exposing only the socket to the sandbox user.
   GpgAgentConfig gpg_agent = 8;
+  // Host filesystem bind mounts declared in the policy.
+  // Each entry maps a path on the K3s node (exposed via `gateway start --expose`)
+  // to a path inside the sandbox pod. The server validates that host_path falls
+  // under an allowed prefix and injects hostPath volumes into the pod spec.
+  repeated HostMount host_mounts = 9;
+}
+
+// A host-to-sandbox bind mount declaration.
+message HostMount {
+  // Absolute path on the K3s node filesystem (must be under an exposed root).
+  string host_path = 1;
+  // Absolute path inside the sandbox container where the mount appears.
+  string mount_path = 2;
+  // When true, the mount is read-only inside the sandbox.
+  bool read_only = 3;
 }
 
 // Filesystem access policy.
