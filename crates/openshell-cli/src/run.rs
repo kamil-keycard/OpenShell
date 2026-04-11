@@ -1848,6 +1848,7 @@ pub async fn sandbox_create_with_bootstrap(
     ssh_key: Option<&str>,
     providers: &[String],
     secrets: &[String],
+    file_secrets: &[String],
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
@@ -1880,6 +1881,7 @@ pub async fn sandbox_create_with_bootstrap(
         ssh_key,
         providers,
         secrets,
+        file_secrets,
         policy,
         forward,
         command,
@@ -1936,6 +1938,7 @@ pub async fn sandbox_create(
     ssh_key: Option<&str>,
     providers: &[String],
     secrets: &[String],
+    file_secrets: &[String],
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
@@ -2027,6 +2030,24 @@ pub async fn sandbox_create(
         })
         .collect();
 
+    let parsed_file_secrets: HashMap<String, String> = file_secrets
+        .iter()
+        .filter_map(|s| {
+            let (path, urn) = s.split_once('=')?;
+            if !Path::new(path).is_absolute() {
+                eprintln!("warning: --file-secret path must be absolute, skipping: {path}");
+                return None;
+            }
+            if !urn.starts_with("urn:secret-b64:") {
+                eprintln!(
+                    "warning: --file-secret URN must use urn:secret-b64: prefix, skipping: {urn}"
+                );
+                return None;
+            }
+            Some((path.to_string(), urn.to_string()))
+        })
+        .collect();
+
     let inferred_types: Vec<String> = {
         let secret_keys: HashSet<&str> = parsed_secrets.keys().map(String::as_str).collect();
         let registry = ProviderRegistry::new();
@@ -2060,6 +2081,7 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             secrets: parsed_secrets,
+            file_secrets: parsed_file_secrets,
             template,
             ..SandboxSpec::default()
         }),
