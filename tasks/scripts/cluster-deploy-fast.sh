@@ -225,7 +225,7 @@ compute_fingerprint() {
   fi
 
   # Layer uncommitted changes on top so dirty files trigger a rebuild too.
-  for path in "${changed_files[@]}"; do
+  for path in ${changed_files[@]+"${changed_files[@]}"}; do
     case "${component}" in
       gateway)
         if ! matches_gateway "${path}"; then
