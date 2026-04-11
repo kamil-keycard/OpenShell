@@ -188,6 +188,14 @@ impl OpenShell for OpenShellService {
         // Validate field sizes before any I/O (fail fast on oversized payloads).
         validate_sandbox_spec(&request.name, &spec)?;
 
+        // Validate host mount prefixes against the server-side allowlist.
+        if let Some(ref policy) = spec.policy {
+            validate_host_mount_prefixes(
+                &policy.host_mounts,
+                &self.state.config.allowed_host_path_prefixes,
+            )?;
+        }
+
         let mut spec = spec;
 
         // Ensure process identity defaults to "sandbox" when missing or
@@ -3371,6 +3379,44 @@ fn validate_sandbox_spec(
         if size > MAX_POLICY_SIZE {
             return Err(Status::invalid_argument(format!(
                 "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate that host mount paths fall under an allowed prefix.
+///
+/// When `allowed_prefixes` is empty, host mounts are not permitted at all
+/// (the cluster was not started with `--expose`). When non-empty, each
+/// mount's `host_path` must start with at least one allowed prefix.
+fn validate_host_mount_prefixes(
+    mounts: &[openshell_core::proto::HostMount],
+    allowed_prefixes: &[String],
+) -> Result<(), Status> {
+    if mounts.is_empty() {
+        return Ok(());
+    }
+
+    if allowed_prefixes.is_empty() {
+        return Err(Status::failed_precondition(
+            "host_mounts are declared in the policy but no host paths are exposed on this gateway. \
+             Start the gateway with `--expose <dir>` to enable bind mounts.",
+        ));
+    }
+
+    for mount in mounts {
+        let path = mount.host_path.as_str();
+        let allowed = allowed_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()));
+        if !allowed {
+            return Err(Status::invalid_argument(format!(
+                "host_mount host_path '{}' is not under any exposed directory. \
+                 Allowed prefixes: {}",
+                path,
+                allowed_prefixes.join(", "),
             )));
         }
     }
