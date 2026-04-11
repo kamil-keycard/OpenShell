@@ -112,7 +112,7 @@
 - Provider types: claude, codex, opencode, generic, openai, anthropic, nvidia, gitlab, github, outlook
 
 ## File Secret Mounts
-- CLI: `--file-secret PATH=URN` flag on sandbox run (main.rs ~1153)
+- Policy YAML: `secret_mounts` in the policy file (CLI --file-secret flag was removed)
 - Proto: `SandboxSpec.file_secrets` (map<string,string>, field 11 in datamodel.proto) + `SandboxPolicy.secret_mounts` (repeated SecretMount, field 6 in sandbox.proto)
 - Proto response: `GetSandboxProviderEnvironmentResponse.file_secrets` (map<string,bytes>, field 2 in openshell.proto)
 - Policy YAML: `secret_mounts` list with `SecretMountDef` {source_urn, target_path, mode} in PolicyFile

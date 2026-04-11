@@ -1415,19 +1415,21 @@ sequenceDiagram
     SB->>SB: Apply Landlock, seccomp, exec child
 ```
 
-### CLI Usage
+### Policy Declaration
 
-The `--file-secret` flag binds a target path to a Keycard resource URN:
+File secrets are declared in the policy YAML via `secret_mounts`. Each entry binds a target path to a Keycard resource URN:
 
-```bash
-openshell sandbox run \
-  --provider my-keycard-provider \
-  --file-secret /sandbox/.ssh/id_ed25519=urn:secret-b64:ssh-private-key \
-  --file-secret /sandbox/.gnupg/pubring.kbx=urn:secret-b64:gpg-keyring \
-  -- /bin/bash
+```yaml
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-private-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+  - source_urn: "urn:secret-b64:gpg-keyring"
+    target_path: "/sandbox/.gnupg/pubring.kbx"
+    mode: "0600"
 ```
 
-The URN must use the `urn:secret-b64:` prefix. The secret content is stored base64-encoded in Keycard and decoded by the gateway during resolution. A Keycard provider must be attached to the sandbox.
+The URN must use the `urn:secret-b64:` prefix. The secret content is stored base64-encoded in Keycard and decoded by the gateway during resolution. A Keycard provider must be attached to the sandbox via `secrets.provider` in the policy.
 
 ### Gateway Resolution
 

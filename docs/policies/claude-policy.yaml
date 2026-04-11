@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 version: 1
 
-# Keycard secret bindings — uncomment and fill in to declare secrets in the
-# policy instead of passing --secret / --provider on the CLI.
+# Keycard secret bindings — uncomment and fill in to declare secrets.
 #
 # secrets:
 #   provider: keyvengers

@@ -654,7 +654,7 @@ Declares environment variable secret bindings and the Keycard provider used to r
 | `provider` | `string` | `""` | Name of the Keycard provider used for credential resolution |
 | `env` | `map<string, string>` | `{}` | Map of environment variable name to Keycard resource URN |
 
-**Resolution flow**: At sandbox creation, `extract_policy_secrets()` merges `secrets.env` entries into `SandboxSpec.secrets` and appends `secrets.provider` to `SandboxSpec.providers`. CLI-provided values take precedence on conflict (first-write wins). The gateway then resolves each URN via the Keycard provider's `exchange_token()` and injects the resulting values as environment variables. See `crates/openshell-server/src/grpc.rs` -- `extract_policy_secrets()`.
+**Resolution flow**: At sandbox creation, `extract_policy_secrets()` extracts `secrets.env` entries into `SandboxSpec.secrets` and appends `secrets.provider` to `SandboxSpec.providers`. The policy is the sole source of secret configuration. The gateway then resolves each URN via the Keycard provider's `exchange_token()` and injects the resulting values as environment variables. See `crates/openshell-server/src/grpc.rs` -- `extract_policy_secrets()`.
 
 **OPA exclusion**: Both `secrets` and `secret_mounts` are excluded from the JSON data loaded into the OPA engine. Secret URNs and provider names never leak into the Rego evaluation context. See `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
 

@@ -60,104 +60,9 @@ openshell sandbox create \
 
 When the sandbox starts, OpenShell automatically provisions a Keycard APPLICATION and injects the per-sandbox `KEYCARD_CLIENT_ID` and `KEYCARD_CLIENT_SECRET` into the sandbox environment. These credentials are unique to this sandbox and are deleted when the sandbox is destroyed.
 
-### With Secrets
-
-If the sandbox needs access to specific resources through Keycard token exchange, pass secrets with `--secret`:
-
-```bash
-openshell sandbox create \
-  --name my-sandbox \
-  --provider keyvengers \
-  --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key \
-  -- claude
-```
-
-Secrets require at least one Keycard provider attached to the sandbox. The gateway resolves secrets at runtime by exchanging the per-sandbox credentials for access tokens scoped to the requested resource URN.
-
-### With File Secrets (SSH Keys, GPG Keys)
-
-File secrets are binary or multi-line secrets (SSH private keys, GPG keyrings) that need to be written to a specific filesystem path inside the sandbox rather than injected as environment variables.
-
-File secrets use the `urn:secret-b64:` URN prefix. The secret must be stored in Keycard as a base64-encoded blob. At sandbox startup, OpenShell performs the standard token exchange, base64-decodes the result, and writes the raw content to the target path with secure permissions (`0600`).
-
-#### Storing a GPG signing key in Keycard
-
-Export your GPG key in armored format and base64-encode it before storing it in Keycard:
-
-```bash
-gpg --export-secret-keys --armor your-key-id@example.com | base64 | \
-  keycard secret create gpg:signing-key --stdin
-```
-
-If your Keycard CLI accepts a value directly:
-
-```bash
-gpg --export-secret-keys --armor your-key-id@example.com | base64 > /tmp/gpg-key-b64.txt
-keycard secret create gpg:signing-key --value-file /tmp/gpg-key-b64.txt
-rm /tmp/gpg-key-b64.txt
-```
-
-#### Creating a sandbox with a GPG signing key
-
-Mount the GPG key into the sandbox using `--file-secret`:
-
-```bash
-openshell sandbox create \
-  --name my-sandbox \
-  --provider keyvengers \
-  --file-secret /sandbox/.gnupg/private-key.asc=urn:secret-b64:gpg:signing-key \
-  -- claude
-```
-
-This does the following at sandbox startup:
-
-1. The gateway exchanges per-sandbox credentials for the `gpg:signing-key` resource, receiving the base64-encoded armored key as the `access_token`
-2. The gateway base64-decodes the token to recover the raw armored GPG key
-3. The sandbox supervisor writes the decoded content to `/sandbox/.gnupg/private-key.asc` with `0600` permissions and `sandbox:sandbox` ownership
-4. The supervisor sets `GNUPGHOME=/sandbox/.gnupg` in the sandbox environment
-5. Landlock enforcement adds `/sandbox/.gnupg` to the read-only path list
-
-Once inside the sandbox, import the key and configure git:
-
-```bash
-gpg --import /sandbox/.gnupg/private-key.asc
-git config --global user.signingkey <your-key-id>
-git config --global commit.gpgsign true
-```
-
-#### Combining file secrets with environment variable secrets
-
-You can mix `--secret` (env var) and `--file-secret` (file mount) in the same sandbox:
-
-```bash
-openshell sandbox create \
-  --name my-sandbox \
-  --provider keyvengers \
-  --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key \
-  --file-secret /sandbox/.gnupg/private-key.asc=urn:secret-b64:gpg:signing-key \
-  --file-secret /sandbox/.ssh/id_ed25519=urn:secret-b64:ssh:private-key \
-  -- claude
-```
-
-#### Storing an SSH private key in Keycard
-
-```bash
-base64 < ~/.ssh/id_ed25519 | keycard secret create ssh:private-key --stdin
-```
-
-Then mount it:
-
-```bash
-openshell sandbox create \
-  --name my-sandbox \
-  --provider keyvengers \
-  --file-secret /sandbox/.ssh/id_ed25519=urn:secret-b64:ssh:private-key \
-  -- claude
-```
-
 ## Declaring Secrets in the Policy File
 
-Instead of passing `--secret`, `--file-secret`, and `--provider` on the CLI, you can declare all secret bindings in the policy YAML. This makes the policy the single source of truth for sandbox configuration.
+All secret bindings (env var secrets, file secret mounts, and the Keycard provider) are declared in the policy YAML. The policy is the single source of truth for sandbox secret configuration.
 
 ### Policy-only sandbox creation
 
@@ -188,22 +93,7 @@ openshell sandbox create \
   -- claude
 ```
 
-No `--secret`, `--file-secret`, or `--provider` flags are needed. The gateway extracts the Keycard provider, env var secrets, and file secret mounts from the policy at sandbox creation time.
-
-### Merge semantics
-
-When both the policy and CLI declare the same secret, the CLI value takes precedence. This lets you override specific secrets without editing the policy file:
-
-```bash
-# Policy declares ANTHROPIC_API_KEY, but CLI overrides it with a different URN
-openshell sandbox create \
-  --name my-sandbox \
-  --policy policy.yaml \
-  --secret ANTHROPIC_API_KEY=urn:secret:my-personal-key \
-  -- claude
-```
-
-The same precedence applies to `--file-secret` (overrides `secret_mounts` by target path) and `--provider` (added alongside the policy-declared provider if different).
+The gateway extracts the Keycard provider, env var secrets, and file secret mounts from the policy at sandbox creation time.
 
 ### secrets block reference
 
@@ -232,7 +122,54 @@ File secret URNs must use the `urn:secret-b64:` prefix. The part after the prefi
 | `urn:secret-b64:ssh:private-key` | `ssh:private-key` | SSH private key (PEM, base64-encoded) |
 | `urn:secret-b64:ssh:deploy-key` | `ssh:deploy-key` | Deploy key for CI (PEM, base64-encoded) |
 
-Plain `urn:resource:` URNs are for environment variable secrets only and are rejected by `--file-secret`.
+Plain `urn:resource:` URNs are for environment variable secrets only and are rejected for file secret mounts.
+
+### File Secrets (SSH Keys, GPG Keys)
+
+File secrets are binary or multi-line secrets (SSH private keys, GPG keyrings) that need to be written to a specific filesystem path inside the sandbox rather than injected as environment variables.
+
+File secrets use the `urn:secret-b64:` URN prefix. The secret must be stored in Keycard as a base64-encoded blob. At sandbox startup, OpenShell performs the standard token exchange, base64-decodes the result, and writes the raw content to the target path with secure permissions (`0600`).
+
+#### Storing a GPG signing key in Keycard
+
+Export your GPG key in armored format and base64-encode it before storing it in Keycard:
+
+```bash
+gpg --export-secret-keys --armor your-key-id@example.com | base64 | \
+  keycard secret create gpg:signing-key --stdin
+```
+
+#### Storing an SSH private key in Keycard
+
+```bash
+base64 < ~/.ssh/id_ed25519 | keycard secret create ssh:private-key --stdin
+```
+
+#### Example policy with file secrets
+
+```yaml
+# policy.yaml
+version: 1
+
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+
+secret_mounts:
+  - source_urn: "urn:secret-b64:gpg:signing-key"
+    target_path: "/sandbox/.gnupg/private-key.asc"
+    mode: "0600"
+  - source_urn: "urn:secret-b64:ssh:private-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+```
+
+```bash
+openshell sandbox create --policy policy.yaml -- claude
+```
+
+At sandbox startup, the gateway resolves each file secret, base64-decodes the content, and the supervisor writes it to the target path with `0600` permissions and `sandbox:sandbox` ownership. Landlock enforcement adds the paths to the read-only set, and companion environment variables (`GIT_SSH_COMMAND`, `GNUPGHOME`) are injected automatically for well-known path patterns.
 
 ## Provider Configuration Reference
 
@@ -256,7 +193,7 @@ Plain `urn:resource:` URNs are for environment variable secrets only and are rej
 
 ### "sandbox has secrets but no keycard provider attached"
 
-The sandbox has secrets (from CLI `--secret`/`--file-secret` flags or from `secrets`/`secret_mounts` in the policy) but no Keycard provider. Fix by either adding `secrets.provider` to the policy or passing `--provider <name>` on the CLI.
+The sandbox has secrets (from `secrets`/`secret_mounts` in the policy) but no Keycard provider. Fix by adding `secrets.provider` to your policy or attaching a provider with `--provider <name>`.
 
 ### "keycard provider missing required config keys"
 

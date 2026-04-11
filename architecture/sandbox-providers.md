@@ -216,10 +216,9 @@ If a requested provider name is not found, sandbox creation fails with a
 
 ## Policy-Declared Secrets
 
-Secret bindings (env var secrets, file secret mounts, and the Keycard provider) can be
-declared directly in the policy YAML, making the policy the single source of truth for
-sandbox configuration. When a policy declares secrets, the `--secret`, `--file-secret`,
-and `--provider` CLI flags become optional.
+Secret bindings (env var secrets, file secret mounts, and the Keycard provider) are
+declared in the policy YAML. The policy is the single source of truth for sandbox
+secret configuration.
 
 ### Policy Schema
 
@@ -251,51 +250,35 @@ in `proto/sandbox.proto`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `secrets.provider` | `string` | Name of the Keycard provider on the gateway. Required when `env` is non-empty. Equivalent to `--provider` on the CLI. |
-| `secrets.env` | `map<string, string>` | Env var name → Keycard resource URN. Each entry becomes an environment variable in the sandbox. Equivalent to individual `--secret KEY=URN` flags. |
+| `secrets.provider` | `string` | Name of the Keycard provider on the gateway. Required when `env` is non-empty. |
+| `secrets.env` | `map<string, string>` | Env var name → Keycard resource URN. Each entry becomes an environment variable in the sandbox. |
 
 The `secret_mounts` field uses the existing `SecretMount` proto message and
-`SecretMountDef` serde struct. Each entry is equivalent to a `--file-secret PATH=URN`
-CLI flag.
+`SecretMountDef` serde struct.
 
-### Extraction and Merge Semantics
+### Extraction Semantics
 
 The gateway's `extract_policy_secrets()` function (`crates/openshell-server/src/grpc.rs`)
 runs during `create_sandbox()`, after policy validation but before provider validation.
-It reads the parsed `SandboxPolicy` and merges its secret declarations into `SandboxSpec`:
+It reads the parsed `SandboxPolicy` and extracts its secret declarations into `SandboxSpec`:
 
-1. **`secrets.env` → `SandboxSpec.secrets`**: Each `(key, urn)` pair is inserted via
-   `entry().or_insert()`. Because the CLI populates `SandboxSpec.secrets` first, CLI
-   values take precedence when both declare the same env var key.
+1. **`secrets.env` → `SandboxSpec.secrets`**: Each `(key, urn)` pair is inserted directly.
+   The policy is the sole source of secret configuration.
 
 2. **`secrets.provider` → `SandboxSpec.providers`**: The provider name is appended to the
-   providers list if not already present. This means `--provider` on the CLI and
-   `secrets.provider` in the policy are additive — both providers are included.
+   providers list if not already present.
 
 3. **`secret_mounts` → `SandboxSpec.file_secrets`**: Each mount's `(target_path, source_urn)`
-   pair is inserted via `entry().or_insert()`. CLI `--file-secret` flags for the same
-   target path take precedence.
+   pair is inserted directly.
 
 This extraction happens before provider validation, so policy-declared providers are
 included in the validation loop that checks provider existence on the gateway.
 
-### CLI Override Examples
-
-Policy-only creation (no CLI flags needed):
+### Usage
 
 ```bash
 openshell sandbox create --policy policy.yaml -- claude
 ```
-
-CLI override of a single secret declared in the policy:
-
-```bash
-openshell sandbox create --policy policy.yaml \
-  --secret ANTHROPIC_API_KEY=urn:secret:my-personal-key \
-  -- claude
-```
-
-The CLI-provided URN for `ANTHROPIC_API_KEY` wins over the policy's value.
 
 ### Validation
 
