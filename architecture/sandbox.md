@@ -36,7 +36,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
-| `gpg_agent.rs` | GPG agent lifecycle: split-directory setup, daemon spawn, key import, passphrase pre-seed, socket symlink, `GpgAgentHandle` with drop-based cleanup |
+| `gpg_agent.rs` | GPG agent lifecycle: split-directory setup, daemon spawn, key import, passphrase pre-seed, extra-socket exposure, `GpgAgentHandle` with drop-based cleanup |
 | `child_env.rs` | Companion environment variable builders for proxy, TLS, file secret mounts (SSH, GPG), and GPG agent signing |
 | `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
@@ -1415,7 +1415,8 @@ sequenceDiagram
     GW-->>SB: GetSandboxProviderEnvironmentResponse(env_vars, file_secrets)
 
     Note over SB: Before Landlock enforcement
-    SB->>SB: write_file_secrets(): write to disk, 0600, chown sandbox:sandbox
+    SB->>SB: Extract GPG private key from file_secrets (if gpg_agent configured)
+    SB->>SB: write_file_secrets(): write remaining secrets to disk, 0600, chown sandbox:sandbox
     SB->>SB: Inject paths into Landlock read_only
     SB->>SB: Inject companion env vars (GIT_SSH_COMMAND, GNUPGHOME)
     SB->>SB: Apply Landlock, seccomp, exec child
@@ -1543,12 +1544,12 @@ The agent uses two directories with strict privilege separation:
   └── S.gpg-agent                     (Unix domain socket)
 
 /sandbox/.gnupg/                      (sandbox:sandbox 0700)
-  ├── pubring.kbx                     (copy of public keyring only)
+  ├── pubring.kbx                     (imported public keyring)
   ├── gpg.conf                        (no-autostart)
-  └── S.gpg-agent                     (symlink → /run/openshell-gpg/private/S.gpg-agent)
+  └── S.gpg-agent                     (extra socket, chowned to sandbox)
 ```
 
-The sandbox user sees only public key material and a socket symlink. Private keys, the agent's keyring, and the actual socket file live in a root-only directory that Landlock denies access to (it is not in any allow list).
+The sandbox user sees only public key material and the agent's extra socket. Private keys, the agent's keyring, and the primary socket file live in a root-only directory that Landlock denies access to (it is not in any allow list). The extra socket is a real socket file (not a symlink) created by the `extra-socket` directive in `gpg-agent.conf`, so both DAC and Landlock allow the sandbox user to connect.
 
 ### Startup Lifecycle
 
@@ -1566,18 +1567,19 @@ sequenceDiagram
     GW->>GW: secrets["__OPENSHELL_GPG_PASSPHRASE"] = passphrase_urn
 
     Note over SB: run_sandbox() startup
-    SB->>SB: write_file_secrets() writes private key to disk
-    SB->>SB: start_gpg_agent_from_config()
+    SB->>SB: Extract GPG private key from file_secrets (before write_file_secrets)
+    SB->>SB: write_file_secrets() writes remaining secrets to disk
+    SB->>SB: start_gpg_agent_from_config(gpg_private_key)
     SB->>SB: Create /run/openshell-gpg/private/ (root 0700)
     SB->>SB: Create /sandbox/.gnupg/ (sandbox 0700)
     SB->>SB: Write gpg-agent.conf (infinite cache, preset allowed)
     SB->>GA: gpg-agent --daemon --homedir /run/openshell-gpg/private/
     SB->>GA: gpg --import private-key.asc
-    SB->>SB: get_keygrip() via gpg --with-keygrip --list-secret-keys
-    SB->>GA: gpg-preset-passphrase --preset <keygrip> (passphrase on stdin)
-    SB->>SB: Export public keyring to /sandbox/.gnupg/pubring.kbx
+    SB->>SB: get_all_keygrips() via gpg --with-keygrip --list-secret-keys
+    SB->>GA: gpg-preset-passphrase --preset (for each keygrip, passphrase on stdin)
+    SB->>SB: Export public key and import into /sandbox/.gnupg/ keyring
     SB->>SB: Write gpg.conf (no-autostart)
-    SB->>SB: Symlink S.gpg-agent into /sandbox/.gnupg/
+    SB->>SB: Wait for extra socket at /sandbox/.gnupg/S.gpg-agent, chown to sandbox
     SB->>SB: Write .gitconfig (if signing_key_id set)
     SB->>SB: Inject GNUPGHOME=/sandbox/.gnupg into provider_env
     SB->>SB: Add /sandbox/.gnupg to Landlock read_write
@@ -1585,13 +1587,13 @@ sequenceDiagram
     SB->>SB: Register agent PID as managed child
     Note over SB: Continue with proxy, namespace, child spawn...
     SB->>Child: exec (GNUPGHOME=/sandbox/.gnupg)
-    Child->>GA: gpg --sign (via Unix socket symlink)
+    Child->>GA: gpg --sign (via extra socket)
     GA-->>Child: Signature (private key never leaves agent)
 ```
 
 **Step-by-step in `start_gpg_agent_from_config()`** (`crates/openshell-sandbox/src/lib.rs`):
 
-1. Extract the private key bytes from `file_secrets` at `/var/lib/openshell/gpg/private-key.asc` (written earlier by `write_file_secrets()`).
+1. Receive the private key bytes directly (extracted from `file_secrets` before `write_file_secrets()` ran, so the key never touches disk as sandbox-readable).
 2. Extract the passphrase from `provider_env` under `__OPENSHELL_GPG_PASSPHRASE`.
 3. Resolve the `sandbox` user's UID/GID via `nix::unistd::User::from_name()`.
 4. Call `gpg_agent::start_gpg_agent()` which performs the directory setup and daemon lifecycle (see below).
@@ -1609,11 +1611,11 @@ sequenceDiagram
 5. Write private key to the private directory.
 6. Start `gpg-agent --daemon --homedir /run/openshell-gpg/private/`.
 7. Import the private key via `gpg --batch --import`.
-8. Extract the keygrip via `gpg --with-keygrip --list-secret-keys`.
-9. Pre-seed the passphrase via `gpg-preset-passphrase --preset <keygrip>` (passphrase piped on stdin).
-10. Export the public keyring to `/sandbox/.gnupg/pubring.kbx`, `chown` to sandbox user.
+8. Extract all keygrips via `gpg --with-keygrip --list-secret-keys` (primary key + subkeys).
+9. Pre-seed the passphrase for each keygrip via `gpg-preset-passphrase --preset <keygrip>` with `GNUPGHOME` env var (passphrase piped on stdin).
+10. Export the public key and import it into the sandbox keyring at `/sandbox/.gnupg/` via `gpg --import`.
 11. Write `gpg.conf` with `no-autostart` to `/sandbox/.gnupg/`, `chown` to sandbox user.
-12. Create a symlink from `/sandbox/.gnupg/S.gpg-agent` to `/run/openshell-gpg/private/S.gpg-agent`.
+12. Wait for the extra socket at `/sandbox/.gnupg/S.gpg-agent` (created by gpg-agent via the `extra-socket` directive), then `chown` it to the sandbox user.
 13. If `signing_key_id` is set, write `/sandbox/.gitconfig` with `[user] signingkey` and `[commit] gpgsign = true`, `chown` to sandbox user.
 14. Read the agent PID via `gpg-connect-agent GETINFO pid /bye`.
 15. Return a `GpgAgentHandle` containing the PID and both directory paths.
@@ -1626,7 +1628,7 @@ sequenceDiagram
 
 | Threat | Mitigation |
 |--------|-----------|
-| Sandbox user reads private key | Private key lives in `/run/openshell-gpg/private/` (root 0700). Not in any Landlock allow list, so Landlock denies access even if the user discovers the path. |
+| Sandbox user reads private key | Private key is extracted from `file_secrets` before `write_file_secrets()` runs, so it never touches disk as sandbox-readable. It lives only in `/run/openshell-gpg/private/` (root 0700), which is not in any Landlock allow list. |
 | Sandbox user reads passphrase from env | `__OPENSHELL_GPG_PASSPHRASE` is removed from `provider_env` before the child process starts. |
 | Sandbox user attaches to gpg-agent via ptrace | Seccomp blocks `ptrace` and `process_vm_readv` syscalls. |
 | Sandbox user impersonates signing via raw socket | `gpg-agent` authenticates via the Unix socket protocol. The sandbox user can only request operations the agent permits (sign, encrypt). The agent holds the key but never exports it. |
