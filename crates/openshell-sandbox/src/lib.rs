@@ -171,7 +171,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine) = load_policy(
+    let (mut policy, opa_engine, gpg_agent_config) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -257,6 +257,27 @@ pub async fn run_sandbox(
             "File secrets processed"
         );
     }
+
+    // Start GPG agent if configured. The private key was written by
+    // write_file_secrets() to /var/lib/openshell/gpg/private-key.asc.
+    // The passphrase arrives via provider_env as __OPENSHELL_GPG_PASSPHRASE.
+    #[cfg(unix)]
+    let _gpg_agent_handle = if gpg_agent_config.is_some() {
+        match start_gpg_agent_from_config(
+            &gpg_agent_config,
+            &file_secrets,
+            &mut provider_env,
+            &mut policy,
+        ) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(error = %e, "GPG agent failed to start, continuing without signing support");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -1209,7 +1230,11 @@ async fn load_policy(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
+) -> Result<(
+    SandboxPolicy,
+    Option<Arc<OpaEngine>>,
+    Option<openshell_core::proto::GpgAgentConfig>,
+)> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         info!(
@@ -1233,7 +1258,7 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine))));
+        return Ok((policy, Some(Arc::new(engine)), None));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1292,8 +1317,9 @@ async fn load_policy(
         info!("Creating OPA engine from proto policy data");
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
+        let gpg_agent_config = proto_policy.gpg_agent.clone();
         let policy = SandboxPolicy::try_from(proto_policy)?;
-        return Ok((policy, opa_engine));
+        return Ok((policy, opa_engine, gpg_agent_config));
     }
 
     // No policy source available
@@ -1409,6 +1435,84 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 /// to the configured sandbox user/group. This runs as the supervisor (root)
 /// before forking the child process.
 #[cfg(unix)]
+/// Start the GPG agent from the resolved config, file secrets, and provider env.
+///
+/// Extracts the private key from `file_secrets`, the passphrase from
+/// `provider_env`, starts the agent, injects GNUPGHOME into `provider_env`,
+/// adds the socket directory to Landlock read_write, and registers the
+/// agent as a managed child.
+#[cfg(unix)]
+fn start_gpg_agent_from_config(
+    gpg_agent_config: &Option<openshell_core::proto::GpgAgentConfig>,
+    file_secrets: &std::collections::HashMap<String, Vec<u8>>,
+    provider_env: &mut std::collections::HashMap<String, String>,
+    policy: &mut SandboxPolicy,
+) -> Result<gpg_agent::GpgAgentHandle> {
+    use nix::unistd::{Group, User};
+
+    let config = gpg_agent_config
+        .as_ref()
+        .ok_or_else(|| miette::miette!("gpg_agent_config is None"))?;
+
+    let private_key_path = "/var/lib/openshell/gpg/private-key.asc";
+    let private_key = file_secrets
+        .get(private_key_path)
+        .ok_or_else(|| miette::miette!("GPG private key not found in file_secrets"))?;
+
+    let passphrase_key = "__OPENSHELL_GPG_PASSPHRASE";
+    let passphrase = provider_env
+        .get(passphrase_key)
+        .ok_or_else(|| miette::miette!("GPG passphrase not found in provider_env"))?
+        .clone();
+
+    let sandbox_uid = User::from_name("sandbox")
+        .ok()
+        .flatten()
+        .map(|u| u.uid)
+        .ok_or_else(|| miette::miette!("sandbox user not found"))?;
+    let sandbox_gid = Group::from_name("sandbox")
+        .ok()
+        .flatten()
+        .map(|g| g.gid)
+        .ok_or_else(|| miette::miette!("sandbox group not found"))?;
+
+    let signing_key_id = if config.signing_key_id.is_empty() {
+        None
+    } else {
+        Some(config.signing_key_id.as_str())
+    };
+
+    let handle = gpg_agent::start_gpg_agent(
+        private_key,
+        &passphrase,
+        signing_key_id,
+        sandbox_uid,
+        sandbox_gid,
+    )?;
+
+    // Inject GNUPGHOME into provider_env for child processes.
+    for (key, value) in child_env::gpg_agent_env_vars(handle.gnupg_dir()) {
+        provider_env.insert(key.to_string(), value);
+    }
+
+    // Add the sandbox .gnupg directory to Landlock read_write so the
+    // sandbox user can access the socket and public keyring.
+    let gnupg_path = handle.gnupg_dir().to_path_buf();
+    if !policy.filesystem.read_write.contains(&gnupg_path) {
+        policy.filesystem.read_write.push(gnupg_path);
+    }
+
+    // Remove the internal passphrase key from provider_env — the
+    // sandbox user must not see it.
+    provider_env.remove(passphrase_key);
+
+    // Register as a managed child so the SIGCHLD reaper knows about it.
+    #[cfg(target_os = "linux")]
+    register_managed_child(handle.pid());
+
+    Ok(handle)
+}
+
 fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     use nix::unistd::{Group, User, chown};
 
