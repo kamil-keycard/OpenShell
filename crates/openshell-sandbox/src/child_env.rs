@@ -35,6 +35,28 @@ pub(crate) fn tls_env_vars(
     ]
 }
 
+/// Companion env vars for a mounted SSH private key.
+///
+/// Sets `GIT_SSH_COMMAND` so that git uses the mounted key without user
+/// configuration. `IdentitiesOnly=yes` prevents the SSH agent from offering
+/// other keys.
+pub(crate) fn ssh_env_vars(key_path: &Path) -> [(&'static str, String); 1] {
+    [
+        (
+            "GIT_SSH_COMMAND",
+            format!(
+                "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no",
+                key_path.display()
+            ),
+        ),
+    ]
+}
+
+/// Companion env vars for a mounted GPG home directory.
+pub(crate) fn gpg_env_vars(dir_path: &Path) -> [(&'static str, String); 1] {
+    [("GNUPGHOME", dir_path.display().to_string())]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

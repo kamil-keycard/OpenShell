@@ -170,7 +170,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine) = load_policy(
+    let (mut policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -184,25 +184,36 @@ pub async fn run_sandbox(
     #[cfg(unix)]
     validate_sandbox_user(&policy)?;
 
-    // Fetch provider environment variables from the server.
+    // Fetch provider environment variables and file secrets from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-        match grpc_client::fetch_provider_environment(endpoint, id).await {
-            Ok(env) => {
-                info!(env_count = env.len(), "Fetched provider environment");
-                env
+    let (provider_env, file_secrets) =
+        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok(result) => {
+                    info!(
+                        env_count = result.env_vars.len(),
+                        file_secret_count = result.file_secrets.len(),
+                        "Fetched provider environment"
+                    );
+                    (result.env_vars, result.file_secrets)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch provider environment, continuing without");
+                    (
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    )
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch provider environment, continuing without");
-                std::collections::HashMap::new()
-            }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
+        } else {
+            (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    let (mut provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
@@ -212,6 +223,38 @@ pub async fn run_sandbox(
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
+
+    // Write file secrets to disk before Landlock enforcement.
+    // Paths are auto-injected into read_only so Landlock allows read access.
+    // Companion env vars (GIT_SSH_COMMAND, GNUPGHOME) are injected for
+    // well-known path patterns so tools discover the keys automatically.
+    #[cfg(unix)]
+    if !file_secrets.is_empty() {
+        write_file_secrets(&file_secrets, &policy)?;
+        for target_path in file_secrets.keys() {
+            let path_buf = std::path::PathBuf::from(target_path);
+
+            if target_path.contains(".ssh") {
+                for (key, value) in child_env::ssh_env_vars(&path_buf) {
+                    provider_env.entry(key.to_string()).or_insert(value);
+                }
+            } else if target_path.contains(".gnupg") {
+                if let Some(parent) = path_buf.parent() {
+                    for (key, value) in child_env::gpg_env_vars(parent) {
+                        provider_env.entry(key.to_string()).or_insert(value);
+                    }
+                }
+            }
+
+            if !policy.filesystem.read_only.contains(&path_buf) {
+                policy.filesystem.read_only.push(path_buf);
+            }
+        }
+        info!(
+            file_secret_count = file_secrets.len(),
+            "File secrets written and Landlock paths injected"
+        );
+    }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -1436,6 +1479,67 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
 
 #[cfg(not(unix))]
 fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
+    Ok(())
+}
+
+/// Write resolved file secrets to disk with secure permissions.
+///
+/// Each secret is written to its `target_path` with `0600` mode and
+/// `sandbox:sandbox` ownership. Parent directories are created as needed.
+/// Must be called BEFORE Landlock enforcement.
+#[cfg(unix)]
+fn write_file_secrets(
+    file_secrets: &std::collections::HashMap<String, Vec<u8>>,
+    policy: &SandboxPolicy,
+) -> Result<()> {
+    use nix::unistd::{Group, User, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = policy
+        .process
+        .run_as_user
+        .as_deref()
+        .and_then(|name| User::from_name(name).ok().flatten())
+        .map(|u| u.uid);
+
+    let gid = policy
+        .process
+        .run_as_group
+        .as_deref()
+        .and_then(|name| Group::from_name(name).ok().flatten())
+        .map(|g| g.gid);
+
+    for (target_path, content) in file_secrets {
+        let path = std::path::Path::new(target_path);
+
+        // Reject symlinks at the target path (TOCTOU-safe: no child running yet).
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(miette::miette!(
+                    "file secret target '{}' is a symlink — refusing to write \
+                     (potential privilege escalation)",
+                    path.display()
+                ));
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).into_diagnostic()?;
+            chown(parent, uid, gid).into_diagnostic()?;
+        }
+
+        std::fs::write(path, content).into_diagnostic()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .into_diagnostic()?;
+        chown(path, uid, gid).into_diagnostic()?;
+
+        debug!(
+            path = %path.display(),
+            size = content.len(),
+            "Wrote file secret"
+        );
+    }
+
     Ok(())
 }
 
