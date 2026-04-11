@@ -21,6 +21,10 @@ message SandboxPolicy {
   repeated SecretMount secret_mounts = 6;
   // Secret bindings: Keycard provider and env var secrets.
   PolicySecrets secrets = 7;
+  // GPG agent configuration for commit signing.
+  // When present, the supervisor spawns a gpg-agent daemon with the private key
+  // loaded in a root-only directory, exposing only the socket to the sandbox user.
+  GpgAgentConfig gpg_agent = 8;
 }
 
 // Filesystem access policy.
@@ -201,6 +205,18 @@ message SecretMount {
   string target_path = 2;
   // Unix file mode (e.g. "0600"). Defaults to "0600" if empty.
   string mode = 3;
+}
+
+// GPG agent configuration for commit signing.
+// When present, the supervisor spawns a gpg-agent daemon with the private key
+// loaded in a root-only directory, exposing only the Unix socket to the sandbox user.
+message GpgAgentConfig {
+  // Keycard URN for the ASCII-armored GPG private key (base64-encoded file secret).
+  string private_key_urn = 1;
+  // Keycard URN for the passphrase that decrypts the private key (env-style secret).
+  string passphrase_urn = 2;
+  // GPG key ID (long form). When set, supervisor writes user.signingkey to gitconfig.
+  string signing_key_id = 3;
 }
 
 // Env var secret bindings and the Keycard provider used to resolve them.
