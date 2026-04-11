@@ -433,6 +433,9 @@ message GetSandboxProviderEnvironmentRequest {
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
+  // Resolved file secret contents keyed by target filesystem path.
+  // Values are raw file bytes (base64-decoded from Keycard).
+  map<string, bytes> file_secrets = 2;
 }
 
 // ---------------------------------------------------------------------------

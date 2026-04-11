@@ -17,6 +17,8 @@ message SandboxPolicy {
   ProcessPolicy process = 4;
   // Network access policies keyed by name (e.g. "claude_code", "gitlab").
   map<string, NetworkPolicyRule> network_policies = 5;
+  // Declarative file secret mounts for policy auditing.
+  repeated SecretMount secret_mounts = 6;
 }
 
 // Filesystem access policy.
@@ -187,4 +189,14 @@ message GetSandboxConfigResponse {
   // When policy_source is GLOBAL, the version of the global policy revision.
   // Zero when no global policy is active or when policy_source is SANDBOX.
   uint32 global_policy_version = 7;
+}
+
+// A file secret mount declaration.
+message SecretMount {
+  // Keycard resource URN (e.g. urn:secret-b64:ssh-private-key).
+  string source_urn = 1;
+  // Absolute filesystem path where the secret will be written.
+  string target_path = 2;
+  // Unix file mode (e.g. "0600"). Defaults to "0600" if empty.
+  string mode = 3;
 }

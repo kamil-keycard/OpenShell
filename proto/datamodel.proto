@@ -36,6 +36,10 @@ message SandboxSpec {
   // Per-sandbox secret bindings resolved via Keycard token exchange.
   // Key: env var name exposed to the sandbox, Value: Keycard resource URN.
   map<string, string> secrets = 10;
+  // Per-sandbox file secret bindings resolved via Keycard token exchange.
+  // Key: target filesystem path inside the sandbox, Value: urn:secret-b64:<resource> URN.
+  // The secret content is base64-encoded in Keycard and decoded by the gateway.
+  map<string, string> file_secrets = 11;
 }
 
 // Sandbox template mapped onto Kubernetes pod template inputs.
