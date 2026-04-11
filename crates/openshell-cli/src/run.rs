@@ -5252,13 +5252,13 @@ mod tests {
 
     /// Helper that replicates the secret-key filtering applied to inferred
     /// provider types in `sandbox_create`.
-    fn filter_inferred_types(command: &[String], secret_keys: &HashSet<&str>) -> Vec<String> {
+    fn filter_inferred_types(command: &[String], policy_secret_keys: &HashSet<&str>) -> Vec<String> {
         let registry = ProviderRegistry::new();
         inferred_provider_type(command)
             .into_iter()
             .filter(|t| {
                 let cred_vars = registry.credential_env_vars(t);
-                !cred_vars.iter().any(|v| secret_keys.contains(*v))
+                !cred_vars.iter().any(|v| policy_secret_keys.contains(*v))
             })
             .collect()
     }
