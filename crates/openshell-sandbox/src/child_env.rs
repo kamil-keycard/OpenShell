@@ -50,9 +50,19 @@ pub(crate) fn ssh_env_vars(key_path: &Path) -> [(&'static str, String); 1] {
     )]
 }
 
-/// Companion env vars for a mounted GPG home directory.
+/// Companion env vars for a mounted GPG home directory (secret_mounts path).
 pub(crate) fn gpg_env_vars(dir_path: &Path) -> [(&'static str, String); 1] {
     [("GNUPGHOME", dir_path.display().to_string())]
+}
+
+/// Env vars for GPG agent socket-based signing.
+///
+/// Sets `GNUPGHOME` to a sandbox-accessible directory containing only the
+/// public keyring, a `gpg.conf` that redirects agent communication to the
+/// Unix socket, and the agent socket itself. The private key material is
+/// NOT in this directory.
+pub(crate) fn gpg_agent_env_vars(gnupg_dir: &Path) -> [(&'static str, String); 1] {
+    [("GNUPGHOME", gnupg_dir.display().to_string())]
 }
 
 #[cfg(test)]
@@ -115,6 +125,15 @@ mod tests {
     fn gpg_env_vars_sets_gnupghome() {
         let dir_path = Path::new("/sandbox/.gnupg");
         let vars = gpg_env_vars(dir_path);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].0, "GNUPGHOME");
+        assert_eq!(vars[0].1, "/sandbox/.gnupg");
+    }
+
+    #[test]
+    fn gpg_agent_env_vars_sets_gnupghome_to_sandbox_dir() {
+        let dir_path = Path::new("/sandbox/.gnupg");
+        let vars = gpg_agent_env_vars(dir_path);
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].0, "GNUPGHOME");
         assert_eq!(vars[0].1, "/sandbox/.gnupg");
