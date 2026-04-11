@@ -84,6 +84,13 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// Allowed host-path prefixes for bind mounts.
+    /// When non-empty, sandbox policies may declare `host_mounts` whose
+    /// `host_path` must start with one of these prefixes. Set via
+    /// `OPENSHELL_ALLOWED_HOST_PATHS` (comma-separated).
+    #[serde(default)]
+    pub allowed_host_path_prefixes: Vec<String>,
 }
 
 /// TLS configuration.
@@ -133,6 +140,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            allowed_host_path_prefixes: Vec::new(),
         }
     }
 
@@ -245,6 +253,13 @@ impl Config {
     #[must_use]
     pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
         self.host_gateway_ip = ip.into();
+        self
+    }
+
+    /// Set allowed host-path prefixes for bind mounts.
+    #[must_use]
+    pub fn with_allowed_host_path_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.allowed_host_path_prefixes = prefixes;
         self
     }
 }

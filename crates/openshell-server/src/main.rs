@@ -97,6 +97,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    /// Comma-separated list of allowed host-path prefixes for bind mounts.
+    /// Sandbox policies may declare host_mounts whose host_path must start
+    /// with one of these prefixes.
+    #[arg(long, env = "OPENSHELL_ALLOWED_HOST_PATHS", value_delimiter = ',')]
+    allowed_host_paths: Vec<String>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -186,6 +192,10 @@ async fn main() -> Result<()> {
 
     if let Some(ip) = args.host_gateway_ip {
         config = config.with_host_gateway_ip(ip);
+    }
+
+    if !args.allowed_host_paths.is_empty() {
+        config = config.with_allowed_host_path_prefixes(args.allowed_host_paths);
     }
 
     if args.disable_tls {
