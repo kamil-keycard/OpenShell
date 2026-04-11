@@ -188,7 +188,7 @@ pub async fn run_sandbox(
     // Fetch provider environment variables and file secrets from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let (provider_env, file_secrets) =
+    let (provider_env, mut file_secrets) =
         if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
             match grpc_client::fetch_provider_environment(endpoint, id).await {
                 Ok(result) => {
@@ -225,6 +225,17 @@ pub async fn run_sandbox(
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
+    // Extract GPG private key from file_secrets before write_file_secrets()
+    // so the key is never written to disk as sandbox-readable. The key is
+    // passed directly to the GPG agent module which stores it in a root-only
+    // directory.
+    #[cfg(unix)]
+    let gpg_private_key = if gpg_agent_config.is_some() {
+        file_secrets.remove("/var/lib/openshell/gpg/private-key.asc")
+    } else {
+        None
+    };
+
     // Write file secrets to disk before Landlock enforcement.
     // Paths are auto-injected into read_only so Landlock allows read access.
     // Companion env vars (GIT_SSH_COMMAND, GNUPGHOME) are injected for
@@ -258,14 +269,14 @@ pub async fn run_sandbox(
         );
     }
 
-    // Start GPG agent if configured. The private key was written by
-    // write_file_secrets() to /var/lib/openshell/gpg/private-key.asc.
+    // Start GPG agent if configured. The private key was extracted above
+    // (before write_file_secrets) so it only exists in the root-only dir.
     // The passphrase arrives via provider_env as __OPENSHELL_GPG_PASSPHRASE.
     #[cfg(unix)]
     let _gpg_agent_handle = if gpg_agent_config.is_some() {
         match start_gpg_agent_from_config(
             &gpg_agent_config,
-            &file_secrets,
+            gpg_private_key,
             &mut provider_env,
             &mut policy,
         ) {
@@ -1435,16 +1446,15 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 /// to the configured sandbox user/group. This runs as the supervisor (root)
 /// before forking the child process.
 #[cfg(unix)]
-/// Start the GPG agent from the resolved config, file secrets, and provider env.
+/// Start the GPG agent from the resolved config and provider env.
 ///
-/// Extracts the private key from `file_secrets`, the passphrase from
-/// `provider_env`, starts the agent, injects GNUPGHOME into `provider_env`,
-/// adds the socket directory to Landlock read_write, and registers the
-/// agent as a managed child.
+/// The private key bytes are passed directly (already extracted from
+/// `file_secrets` before `write_file_secrets` ran, so they never touch
+/// disk as sandbox-readable). The passphrase comes from `provider_env`.
 #[cfg(unix)]
 fn start_gpg_agent_from_config(
     gpg_agent_config: &Option<openshell_core::proto::GpgAgentConfig>,
-    file_secrets: &std::collections::HashMap<String, Vec<u8>>,
+    gpg_private_key: Option<Vec<u8>>,
     provider_env: &mut std::collections::HashMap<String, String>,
     policy: &mut SandboxPolicy,
 ) -> Result<gpg_agent::GpgAgentHandle> {
@@ -1454,10 +1464,8 @@ fn start_gpg_agent_from_config(
         .as_ref()
         .ok_or_else(|| miette::miette!("gpg_agent_config is None"))?;
 
-    let private_key_path = "/var/lib/openshell/gpg/private-key.asc";
-    let private_key = file_secrets
-        .get(private_key_path)
-        .ok_or_else(|| miette::miette!("GPG private key not found in file_secrets"))?;
+    let private_key = gpg_private_key
+        .ok_or_else(|| miette::miette!("GPG private key not found (was it in file_secrets?)"))?;
 
     let passphrase_key = "__OPENSHELL_GPG_PASSPHRASE";
     let passphrase = provider_env
@@ -1483,7 +1491,7 @@ fn start_gpg_agent_from_config(
     };
 
     let handle = gpg_agent::start_gpg_agent(
-        private_key,
+        &private_key,
         &passphrase,
         signing_key_id,
         sandbox_uid,

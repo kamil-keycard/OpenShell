@@ -9,8 +9,8 @@
 //!   and the agent's keyring. The sandbox user cannot access this directory.
 //!
 //! - `/sandbox/.gnupg/` — sandbox-accessible, holds only the public keyring,
-//!   a `gpg.conf` that redirects agent communication to the socket in the
-//!   private directory, and a symlink to the agent socket.
+//!   a `gpg.conf` with `no-autostart`, and the agent's extra socket.
+//!   The extra socket is a real file (not a symlink) so Landlock allows access.
 //!
 //! The sandbox user gets signing capability via `gpg --sign` or `git commit -S`
 //! without ever seeing private key material.
@@ -71,8 +71,8 @@ impl Drop for GpgAgentHandle {
 ///
 /// /sandbox/.gnupg/              (sandbox:sandbox 0700)
 ///   ├── pubring.kbx             (copy of public keyring)
-///   ├── gpg.conf                (redirects to agent socket)
-///   └── S.gpg-agent             (symlink → /run/openshell-gpg/private/S.gpg-agent)
+///   ├── gpg.conf                (no-autostart)
+///   └── S.gpg-agent             (extra socket, chowned to sandbox)
 /// ```
 #[cfg(unix)]
 pub(crate) fn start_gpg_agent(
@@ -108,10 +108,17 @@ pub(crate) fn start_gpg_agent(
         .into_diagnostic()?;
 
     // Write gpg-agent.conf to private dir.
-    let agent_conf = "default-cache-ttl 31536000\n\
+    // extra-socket creates a real socket in the sandbox dir (not a symlink),
+    // so Landlock + DAC both allow the sandbox user to connect.
+    let extra_socket_path = sandbox_gnupg_dir.join(SOCKET_NAME);
+    let agent_conf = format!(
+        "default-cache-ttl 31536000\n\
          max-cache-ttl 31536000\n\
-         allow-preset-passphrase\n";
-    std::fs::write(private_dir.join("gpg-agent.conf"), agent_conf)
+         allow-preset-passphrase\n\
+         extra-socket {}\n",
+        extra_socket_path.display()
+    );
+    std::fs::write(private_dir.join("gpg-agent.conf"), &agent_conf)
         .into_diagnostic()
         .wrap_err("failed to write gpg-agent.conf")?;
 
@@ -160,45 +167,32 @@ pub(crate) fn start_gpg_agent(
     }
     info!("GPG private key imported");
 
-    // Get the keygrip for passphrase pre-seeding.
-    let keygrip = get_keygrip(private_dir)?;
+    // Pre-seed the passphrase for every keygrip (primary + subkeys).
+    let keygrips = get_all_keygrips(private_dir)?;
+    for grip in &keygrips {
+        preset_passphrase(private_dir, grip, passphrase)?;
+    }
+    info!(
+        count = keygrips.len(),
+        "GPG passphrase pre-seeded for all keygrips"
+    );
 
-    // Pre-seed the passphrase via gpg-preset-passphrase.
-    preset_passphrase(private_dir, &keygrip, passphrase)?;
-    info!("GPG passphrase pre-seeded");
-
-    // Export the public key to the sandbox-accessible directory.
+    // Export the public key and import into the sandbox-accessible keyring.
     export_public_key(private_dir, sandbox_gnupg_dir)?;
-    chown(
-        &sandbox_gnupg_dir.join("pubring.kbx"),
-        Some(sandbox_uid),
-        Some(sandbox_gid),
-    )
-    .into_diagnostic()
-    .wrap_err("failed to chown public keyring")?;
 
-    // Write gpg.conf that redirects agent to the socket in private dir.
-    let socket_path = private_dir.join(SOCKET_NAME);
+    // Write gpg.conf for the sandbox user's gpg client.
     let gpg_conf = "no-autostart\n";
     std::fs::write(sandbox_gnupg_dir.join("gpg.conf"), gpg_conf)
         .into_diagnostic()
         .wrap_err("failed to write gpg.conf")?;
-    chown(
-        &sandbox_gnupg_dir.join("gpg.conf"),
-        Some(sandbox_uid),
-        Some(sandbox_gid),
-    )
-    .into_diagnostic()?;
 
-    // Symlink the agent socket into the sandbox gnupg dir.
-    let sandbox_socket = sandbox_gnupg_dir.join(SOCKET_NAME);
-    if sandbox_socket.exists() {
-        std::fs::remove_file(&sandbox_socket).into_diagnostic()?;
-    }
-    std::os::unix::fs::symlink(&socket_path, &sandbox_socket)
-        .into_diagnostic()
-        .wrap_err("failed to symlink gpg-agent socket")?;
-    // Symlink ownership doesn't matter on Linux (Landlock checks the target).
+    // Wait for the extra socket to appear (created by gpg-agent via extra-socket
+    // directive), then chown it so the sandbox user can connect.
+    wait_for_socket(&extra_socket_path)?;
+
+    // Chown everything in the sandbox gnupg dir (keyring files, trustdb,
+    // gpg.conf, and the extra socket) to the sandbox user.
+    chown_recursive(sandbox_gnupg_dir, sandbox_uid, sandbox_gid)?;
 
     // Write gitconfig if signing_key_id is set.
     if let Some(key_id) = signing_key_id.filter(|k| !k.is_empty()) {
@@ -239,8 +233,9 @@ fn check_gpg_binaries() -> Result<()> {
     Ok(())
 }
 
-/// Extract the keygrip of the first signing-capable key in the keyring.
-fn get_keygrip(homedir: &Path) -> Result<String> {
+/// Extract all keygrips from the keyring. Keys with signing subkeys have
+/// multiple keygrips; each needs its passphrase pre-seeded.
+fn get_all_keygrips(homedir: &Path) -> Result<Vec<String>> {
     let output = Command::new("gpg")
         .args([
             "--homedir",
@@ -254,27 +249,33 @@ fn get_keygrip(homedir: &Path) -> Result<String> {
         .wrap_err("failed to list secret keys")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(grip) = trimmed.strip_prefix("Keygrip = ") {
-            return Ok(grip.trim().to_string());
-        }
-    }
+    let grips: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("Keygrip = ")
+                .map(|g| g.trim().to_string())
+        })
+        .collect();
 
-    Err(miette::miette!(
-        "no keygrip found in gpg output; key import may have failed"
-    ))
+    if grips.is_empty() {
+        return Err(miette::miette!(
+            "no keygrip found in gpg output; key import may have failed"
+        ));
+    }
+    Ok(grips)
 }
 
 /// Pre-seed the passphrase for a key using `gpg-preset-passphrase`.
+///
+/// Uses `GNUPGHOME` env var to locate the agent socket rather than
+/// `--homedir`, which not all gpg-preset-passphrase builds support.
 fn preset_passphrase(homedir: &Path, keygrip: &str, passphrase: &str) -> Result<()> {
-    let output = Command::new("gpg-preset-passphrase")
-        .args([
-            "--homedir",
-            &homedir.display().to_string(),
-            "--preset",
-            keygrip,
-        ])
+    use std::io::Write;
+
+    let mut child = Command::new("gpg-preset-passphrase")
+        .env("GNUPGHOME", homedir)
+        .args(["--preset", keygrip])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -282,8 +283,6 @@ fn preset_passphrase(homedir: &Path, keygrip: &str, passphrase: &str) -> Result<
         .into_diagnostic()
         .wrap_err("failed to spawn gpg-preset-passphrase")?;
 
-    use std::io::Write;
-    let mut child = output;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(passphrase.as_bytes())
@@ -304,24 +303,55 @@ fn preset_passphrase(homedir: &Path, keygrip: &str, passphrase: &str) -> Result<
     Ok(())
 }
 
-/// Export the public keyring from the private homedir to the sandbox dir.
+/// Export public keys from the private homedir and import them into the
+/// sandbox keyring so that the sandbox user's `gpg` recognises the key.
 fn export_public_key(private_dir: &Path, sandbox_dir: &Path) -> Result<()> {
-    let output = Command::new("gpg")
+    use std::io::Write;
+
+    let export = Command::new("gpg")
         .args([
             "--homedir",
             &private_dir.display().to_string(),
             "--batch",
             "--export",
-            "--output",
-            &sandbox_dir.join("pubring.kbx").display().to_string(),
         ])
         .output()
         .into_diagnostic()
-        .wrap_err("failed to export public keyring")?;
+        .wrap_err("failed to export public key")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !export.status.success() {
+        let stderr = String::from_utf8_lossy(&export.stderr);
         warn!(stderr = %stderr, "public key export produced warnings");
+    }
+
+    let mut child = Command::new("gpg")
+        .args([
+            "--homedir",
+            &sandbox_dir.display().to_string(),
+            "--batch",
+            "--import",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .into_diagnostic()
+        .wrap_err("failed to spawn gpg --import for sandbox keyring")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&export.stdout)
+            .into_diagnostic()
+            .wrap_err("failed to pipe public key to sandbox gpg")?;
+    }
+
+    let status = child
+        .wait()
+        .into_diagnostic()
+        .wrap_err("gpg --import into sandbox keyring failed")?;
+
+    if !status.success() {
+        warn!("gpg --import into sandbox keyring exited with {status}");
     }
     Ok(())
 }
@@ -334,6 +364,7 @@ fn write_gitconfig_signing(
     sandbox_gid: nix::unistd::Gid,
 ) -> Result<()> {
     use nix::unistd::chown;
+    use std::fmt::Write;
 
     let gitconfig_path = Path::new("/sandbox/.gitconfig");
     let mut config = if gitconfig_path.exists() {
@@ -348,7 +379,7 @@ fn write_gitconfig_signing(
         config.push_str("[user]\n");
     }
     if !config.contains("signingkey") {
-        config.push_str(&format!("\tsigningkey = {key_id}\n"));
+        let _ = writeln!(config, "\tsigningkey = {key_id}");
     }
 
     if !config.contains("[commit]") {
@@ -365,6 +396,42 @@ fn write_gitconfig_signing(
 
     info!(key_id, "Wrote git signing configuration");
     Ok(())
+}
+
+/// Recursively chown a directory and all its contents.
+#[cfg(unix)]
+fn chown_recursive(dir: &Path, uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> Result<()> {
+    use nix::unistd::chown;
+
+    chown(dir, Some(uid), Some(gid))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chown {}", dir.display()))?;
+
+    for entry in std::fs::read_dir(dir).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let path = entry.path();
+        chown(&path, Some(uid), Some(gid))
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to chown {}", path.display()))?;
+        if path.is_dir() {
+            chown_recursive(&path, uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Poll until the socket file exists, with a bounded retry.
+fn wait_for_socket(path: &Path) -> Result<()> {
+    for _ in 0..50 {
+        if path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(miette::miette!(
+        "gpg-agent extra socket did not appear at {} within 5 s",
+        path.display()
+    ))
 }
 
 /// Read the gpg-agent PID from the agent-info or pidfile.
