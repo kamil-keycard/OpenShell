@@ -197,9 +197,9 @@ impl OpenShell for OpenShellService {
             validate_policy_safety(policy)?;
         }
 
-        // Extract secrets from policy and merge into spec (CLI takes precedence).
-        // This must happen before provider validation so that policy-declared
-        // providers are included in the validation loop.
+        // Extract secrets from policy into spec. This must happen before
+        // provider validation so that policy-declared providers are included
+        // in the validation loop.
         extract_policy_secrets(&mut spec);
 
         // Validate provider names exist (fail fast) and collect keycard providers
@@ -226,7 +226,7 @@ impl OpenShell for OpenShellService {
         if has_secrets && keycard_providers.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox has secrets but no keycard provider attached; \
-                 add secrets.provider to your policy or use --provider",
+                 add secrets.provider to your policy or attach a provider with --provider",
             ));
         }
 
@@ -3553,33 +3553,26 @@ fn validate_static_fields_unchanged(
     Ok(())
 }
 
-/// Extract secret bindings from the parsed policy and merge them into
-/// `SandboxSpec`. CLI-provided values take precedence on conflict
-/// (first-write wins via `entry().or_insert()`).
+/// Extract secret bindings from the parsed policy into `SandboxSpec`.
+/// Policy is the sole source of secret configuration.
 fn extract_policy_secrets(spec: &mut openshell_core::proto::SandboxSpec) {
     let Some(ref policy) = spec.policy else {
         return;
     };
 
-    // secrets.env → spec.secrets (CLI takes precedence)
     if let Some(ref policy_secrets) = policy.secrets {
         for (key, urn) in &policy_secrets.env {
-            spec.secrets
-                .entry(key.clone())
-                .or_insert_with(|| urn.clone());
+            spec.secrets.insert(key.clone(), urn.clone());
         }
-        // secrets.provider → spec.providers (if not already present)
         if !policy_secrets.provider.is_empty() && !spec.providers.contains(&policy_secrets.provider)
         {
             spec.providers.push(policy_secrets.provider.clone());
         }
     }
 
-    // secret_mounts → spec.file_secrets (CLI takes precedence)
     for mount in &policy.secret_mounts {
         spec.file_secrets
-            .entry(mount.target_path.clone())
-            .or_insert_with(|| mount.source_urn.clone());
+            .insert(mount.target_path.clone(), mount.source_urn.clone());
     }
 }
 
