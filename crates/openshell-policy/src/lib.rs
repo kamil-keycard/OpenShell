@@ -15,9 +15,9 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, GpgAgentConfig as ProtoGpgAgentConfig, L7Allow, L7QueryMatcher, L7Rule,
-    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicySecrets,
-    ProcessPolicy, SandboxPolicy, SecretMount as ProtoSecretMount,
+    FilesystemPolicy, GpgAgentConfig as ProtoGpgAgentConfig, HostMount as ProtoHostMount, L7Allow,
+    L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
+    PolicySecrets, ProcessPolicy, SandboxPolicy, SecretMount as ProtoSecretMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,8 @@ struct PolicyFile {
     secret_mounts: Vec<SecretMountDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gpg_agent: Option<GpgAgentDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    host_mounts: Vec<HostMountDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filesystem_policy: Option<FilesystemDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +72,15 @@ struct GpgAgentDef {
     passphrase_urn: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     signing_key_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostMountDef {
+    host_path: String,
+    mount_path: String,
+    #[serde(default)]
+    read_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -301,6 +312,15 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             .collect(),
         secrets,
         gpg_agent,
+        host_mounts: raw
+            .host_mounts
+            .into_iter()
+            .map(|hm| ProtoHostMount {
+                host_path: hm.host_path,
+                mount_path: hm.mount_path,
+                read_only: hm.read_only,
+            })
+            .collect(),
     }
 }
 
@@ -429,11 +449,22 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         signing_key_id: g.signing_key_id.clone(),
     });
 
+    let host_mounts = policy
+        .host_mounts
+        .iter()
+        .map(|hm| HostMountDef {
+            host_path: hm.host_path.clone(),
+            mount_path: hm.mount_path.clone(),
+            read_only: hm.read_only,
+        })
+        .collect();
+
     PolicyFile {
         version: policy.version,
         secrets,
         secret_mounts,
         gpg_agent,
+        host_mounts,
         filesystem_policy,
         landlock,
         process,
@@ -537,6 +568,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         secret_mounts: Vec::new(),
         secrets: None,
         gpg_agent: None,
+        host_mounts: Vec::new(),
     }
 }
 
@@ -588,6 +620,8 @@ pub enum PolicyViolation {
     InvalidSecrets { reason: String },
     /// A `gpg_agent` block field is invalid.
     InvalidGpgAgent { reason: String },
+    /// A host mount declaration is invalid.
+    InvalidHostMount { reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -625,6 +659,9 @@ impl fmt::Display for PolicyViolation {
             }
             Self::InvalidGpgAgent { reason } => {
                 write!(f, "invalid gpg_agent: {reason}")
+            }
+            Self::InvalidHostMount { reason } => {
+                write!(f, "invalid host_mount: {reason}")
             }
         }
     }
@@ -784,6 +821,57 @@ pub fn validate_sandbox_policy(
             violations.push(PolicyViolation::InvalidSecretMount {
                 reason: format!("source_urn is empty for mount at '{}'", mount.target_path),
             });
+        }
+    }
+
+    // Check host mounts
+    const MAX_HOST_MOUNTS: usize = 16;
+    if policy.host_mounts.len() > MAX_HOST_MOUNTS {
+        violations.push(PolicyViolation::InvalidHostMount {
+            reason: format!(
+                "too many host mounts ({} > {MAX_HOST_MOUNTS})",
+                policy.host_mounts.len()
+            ),
+        });
+    }
+    for mount in &policy.host_mounts {
+        if mount.host_path.is_empty() {
+            violations.push(PolicyViolation::InvalidHostMount {
+                reason: "host_path is empty".to_string(),
+            });
+            continue;
+        }
+        if mount.mount_path.is_empty() {
+            violations.push(PolicyViolation::InvalidHostMount {
+                reason: "mount_path is empty".to_string(),
+            });
+            continue;
+        }
+        for (label, path_str) in [("host_path", &mount.host_path), ("mount_path", &mount.mount_path)] {
+            if path_str.len() > MAX_PATH_LENGTH {
+                violations.push(PolicyViolation::InvalidHostMount {
+                    reason: format!(
+                        "{label} exceeds maximum length ({} > {MAX_PATH_LENGTH}): {}",
+                        path_str.len(),
+                        truncate_for_display(path_str)
+                    ),
+                });
+                continue;
+            }
+            let path = Path::new(path_str);
+            if !path.has_root() {
+                violations.push(PolicyViolation::InvalidHostMount {
+                    reason: format!("{label} must be absolute (start with '/'): {path_str}"),
+                });
+            }
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                violations.push(PolicyViolation::InvalidHostMount {
+                    reason: format!("{label} contains '..' traversal component: {path_str}"),
+                });
+            }
         }
     }
 
@@ -1224,6 +1312,7 @@ network_policies:
             secret_mounts: Vec::new(),
             secrets: None,
             gpg_agent: None,
+            host_mounts: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
