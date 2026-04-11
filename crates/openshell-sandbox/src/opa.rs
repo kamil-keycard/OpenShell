@@ -722,6 +722,8 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
         })
         .collect();
 
+    // Security: secrets and secret_mounts are intentionally excluded from OPA
+    // data. Secret URNs must not leak into the Rego evaluation context.
     serde_json::json!({
         "filesystem_policy": filesystem_policy,
         "landlock": landlock,
@@ -803,6 +805,7 @@ mod tests {
             }),
             network_policies,
             secret_mounts: vec![],
+            secrets: None,
         }
     }
 
@@ -1641,6 +1644,7 @@ process:
             }),
             network_policies,
             secret_mounts: vec![],
+            secrets: None,
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -2258,6 +2262,7 @@ process:
             }),
             network_policies,
             secret_mounts: vec![],
+            secrets: None,
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
@@ -2489,6 +2494,7 @@ network_policies:
             }),
             network_policies,
             secret_mounts: vec![],
+            secrets: None,
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();
         // Port 443
@@ -2822,6 +2828,44 @@ process:
         assert!(
             eval_l7(&engine, &input2),
             "L7 on second port of multi-port should work"
+        );
+    }
+
+    #[test]
+    fn opa_data_excludes_secrets_and_secret_mounts() {
+        use openshell_core::proto::{PolicySecrets, SecretMount};
+
+        let mut proto = test_proto();
+        proto.secrets = Some(PolicySecrets {
+            provider: "keyvengers".to_string(),
+            env: [("ANTHROPIC_API_KEY".to_string(), "urn:secret:claude-api".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        proto.secret_mounts = vec![SecretMount {
+            source_urn: "urn:secret-b64:ssh-key".to_string(),
+            target_path: "/sandbox/.ssh/id_ed25519".to_string(),
+            mode: "0600".to_string(),
+        }];
+
+        let json_str = proto_to_opa_data_json(&proto);
+        let data: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert!(
+            data.get("secrets").is_none(),
+            "secrets must not appear in OPA data"
+        );
+        assert!(
+            data.get("secret_mounts").is_none(),
+            "secret_mounts must not appear in OPA data"
+        );
+        assert!(
+            !json_str.contains("urn:secret:"),
+            "secret URNs must not leak into OPA data"
+        );
+        assert!(
+            data.get("filesystem_policy").is_some(),
+            "non-secret fields should still be present"
         );
     }
 }

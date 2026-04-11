@@ -188,6 +188,20 @@ impl OpenShell for OpenShellService {
         // Validate field sizes before any I/O (fail fast on oversized payloads).
         validate_sandbox_spec(&request.name, &spec)?;
 
+        let mut spec = spec;
+
+        // Ensure process identity defaults to "sandbox" when missing or
+        // empty, then validate policy safety before persisting.
+        if let Some(ref mut policy) = spec.policy {
+            openshell_policy::ensure_sandbox_process_identity(policy);
+            validate_policy_safety(policy)?;
+        }
+
+        // Extract secrets from policy and merge into spec (CLI takes precedence).
+        // This must happen before provider validation so that policy-declared
+        // providers are included in the validation loop.
+        extract_policy_secrets(&mut spec);
+
         // Validate provider names exist (fail fast) and collect keycard providers
         // for lifecycle provisioning after sandbox ID is generated.
         let mut keycard_providers: Vec<(String, Provider)> = Vec::new();
@@ -211,13 +225,13 @@ impl OpenShell for OpenShellService {
         let has_secrets = !spec.secrets.is_empty() || !spec.file_secrets.is_empty();
         if has_secrets && keycard_providers.is_empty() {
             return Err(Status::invalid_argument(
-                "sandbox has secrets but no keycard provider attached",
+                "sandbox has secrets but no keycard provider attached; \
+                 add secrets.provider to your policy or use --provider",
             ));
         }
 
         // Ensure the template always carries the resolved image so clients
         // (CLI, TUI, etc.) can read the actual image from the stored sandbox.
-        let mut spec = spec;
         let template = spec.template.get_or_insert_with(SandboxTemplate::default);
         if template.image.is_empty() {
             template.image = self.state.sandbox_client.default_image().to_string();
@@ -232,13 +246,6 @@ impl OpenShell for OpenShellService {
                     warn!(error = %status, "Rejecting GPU sandbox request");
                     status
                 })?;
-        }
-
-        // Ensure process identity defaults to "sandbox" when missing or
-        // empty, then validate policy safety before persisting.
-        if let Some(ref mut policy) = spec.policy {
-            openshell_policy::ensure_sandbox_process_identity(policy);
-            validate_policy_safety(policy)?;
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -2913,6 +2920,19 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
         hasher.update(key.as_bytes());
         hasher.update(value.encode_to_vec());
     }
+    // secret_mounts is a repeated field (deterministic ordering).
+    for mount in &policy.secret_mounts {
+        hasher.update(mount.encode_to_vec());
+    }
+    if let Some(ref secrets) = policy.secrets {
+        hasher.update(secrets.provider.as_bytes());
+        let mut env_entries: Vec<_> = secrets.env.iter().collect();
+        env_entries.sort_by_key(|(k, _)| k.as_str());
+        for (key, value) in env_entries {
+            hasher.update(key.as_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -3520,7 +3540,46 @@ fn validate_static_fields_unchanged(
             "process policy cannot be changed on a live sandbox (applied at startup)",
         ));
     }
+    if baseline.secret_mounts != new.secret_mounts {
+        return Err(Status::invalid_argument(
+            "secret_mounts cannot be changed on a live sandbox (applied at startup)",
+        ));
+    }
+    if baseline.secrets != new.secrets {
+        return Err(Status::invalid_argument(
+            "secrets cannot be changed on a live sandbox (resolved at startup)",
+        ));
+    }
     Ok(())
+}
+
+/// Extract secret bindings from the parsed policy and merge them into
+/// `SandboxSpec`. CLI-provided values take precedence on conflict
+/// (first-write wins via `entry().or_insert()`).
+fn extract_policy_secrets(spec: &mut openshell_core::proto::SandboxSpec) {
+    let Some(ref policy) = spec.policy else {
+        return;
+    };
+
+    // secrets.env → spec.secrets (CLI takes precedence)
+    if let Some(ref policy_secrets) = policy.secrets {
+        for (key, urn) in &policy_secrets.env {
+            spec.secrets.entry(key.clone()).or_insert_with(|| urn.clone());
+        }
+        // secrets.provider → spec.providers (if not already present)
+        if !policy_secrets.provider.is_empty()
+            && !spec.providers.contains(&policy_secrets.provider)
+        {
+            spec.providers.push(policy_secrets.provider.clone());
+        }
+    }
+
+    // secret_mounts → spec.file_secrets (CLI takes precedence)
+    for mount in &policy.secret_mounts {
+        spec.file_secrets
+            .entry(mount.target_path.clone())
+            .or_insert_with(|| mount.source_urn.clone());
+    }
 }
 
 /// Validate that a filesystem policy update is purely additive: all baseline
