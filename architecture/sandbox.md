@@ -36,7 +36,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
-| `gpg_agent.rs` | GPG agent lifecycle: split-directory setup, daemon spawn, key import, passphrase pre-seed, extra-socket exposure, `GpgAgentHandle` with drop-based cleanup |
+| `gpg_agent.rs` | GPG agent lifecycle: single-homedir setup, headless pinentry, daemon spawn, key import, passphrase pre-seed, main-socket signing, `GpgAgentHandle` with drop-based cleanup |
 | `child_env.rs` | Companion environment variable builders for proxy, TLS, file secret mounts (SSH, GPG), and GPG agent signing |
 | `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
@@ -63,7 +63,7 @@ flowchart TD
     H1 -- Yes --> H2[Write file secrets to disk<br/>Inject Landlock read_only paths<br/>Inject companion env vars]
     H1 -- No --> H3{GPG agent configured?}
     H2 --> H3{GPG agent configured?}
-    H3 -- Yes --> H4[Start gpg-agent daemon<br/>Split directory layout<br/>Inject GNUPGHOME + Landlock paths<br/>Scrub passphrase from env]
+    H3 -- Yes --> H4[Start gpg-agent daemon<br/>Single-homedir + headless pinentry<br/>Inject GNUPGHOME + Landlock paths<br/>Scrub passphrase from env]
     H3 -- No --> I{Proxy mode?}
     H4 --> I{Proxy mode?}
     I -- Yes --> J[Generate ephemeral CA + write TLS files]
@@ -1493,7 +1493,7 @@ Companion env vars use `entry().or_insert()` so they do not override values alre
 
 ## GPG Agent (Commit Signing)
 
-The sandbox supports first-party GPG agent integration that enables `git commit -S` signing inside sandboxes while keeping private key material completely out of the sandbox user's reach. The supervisor spawns a `gpg-agent` daemon with a split directory layout that uses Landlock for privilege separation.
+The sandbox supports first-party GPG agent integration that enables `git commit -S` signing inside sandboxes while keeping private key material completely out of the sandbox user's reach. The supervisor spawns a `gpg-agent` daemon in a single homedir (`/sandbox/.gnupg/`) with the **main** agent socket exposed to the sandbox user and a headless pinentry program for passphrase fallback.
 
 **Files:** `crates/openshell-sandbox/src/gpg_agent.rs` (agent lifecycle), `crates/openshell-policy/src/lib.rs` (`GpgAgentDef` serde type, validation), `crates/openshell-server/src/grpc.rs` (secret extraction, static field enforcement), `crates/openshell-sandbox/src/child_env.rs` (`gpg_agent_env_vars()`), `proto/sandbox.proto` (`GpgAgentConfig` message)
 
@@ -1531,25 +1531,30 @@ Policy validation in `validate_sandbox_policy()` (`crates/openshell-policy/src/l
 1. `gpg.private_key_urn` is inserted into `SandboxSpec.file_secrets` at the well-known path `/var/lib/openshell/gpg/private-key.asc`. This causes the gateway to resolve it via Keycard (base64-decode, 256KB limit) and deliver it alongside other file secrets.
 2. `gpg.passphrase_urn` is inserted into `SandboxSpec.secrets` under the internal key `__OPENSHELL_GPG_PASSPHRASE`. This causes the gateway to resolve it as an env-var secret delivered in `GetSandboxProviderEnvironmentResponse.env_vars`.
 
-### Split Directory Layout
+### Directory Layout
 
-The agent uses two directories with strict privilege separation:
+The agent uses a single GNUPGHOME at `/sandbox/.gnupg/` with per-subtree permission hardening:
 
 ```text
-/run/openshell-gpg/private/           (root:root 0700)
-  ├── gpg-agent.conf                  (allow-preset-passphrase, infinite cache TTL)
-  ├── private-key.asc                 (imported into keyring)
-  ├── pubring.kbx                     (full keyring)
-  ├── private-keys-v1.d/              (GPG private key storage)
-  └── S.gpg-agent                     (Unix domain socket)
+/sandbox/.gnupg/                       (sandbox:sandbox 0700)
+  ├── gpg-agent.conf                   (allow-preset-passphrase, allow-loopback-pinentry, pinentry-program)
+  ├── gpg.conf                         (no-autostart)
+  ├── pubring.kbx                      (public + secret key stubs)
+  ├── trustdb.gpg
+  ├── S.gpg-agent                      (main socket — unrestricted cache access)
+  └── private-keys-v1.d/               (root:root 0700 — sandbox user cannot read)
+      └── <keygrip>.key                (passphrase-protected private key)
 
-/sandbox/.gnupg/                      (sandbox:sandbox 0700)
-  ├── pubring.kbx                     (imported public keyring)
-  ├── gpg.conf                        (no-autostart)
-  └── S.gpg-agent                     (extra socket, chowned to sandbox)
+/run/openshell-gpg/                    (root:root 0755)
+  ├── pinentry-openshell               (headless pinentry script, 0755)
+  └── passphrase                       (root:root 0600 — passphrase for pinentry fallback)
 ```
 
-The sandbox user sees only public key material and the agent's extra socket. Private keys, the agent's keyring, and the primary socket file live in a root-only directory that Landlock denies access to (it is not in any allow list). The extra socket is a real socket file (not a symlink) created by the `extra-socket` directive in `gpg-agent.conf`, so both DAC and Landlock allow the sandbox user to connect.
+**Why a single homedir?** GnuPG's `extra-socket` directive (used in the previous two-directory design) deliberately disables passphrase cache lookups on restricted connections (`agent/cache.c` rejects `CACHE_MODE_NORMAL`). This forces pinentry for every signing operation, which fails without a TTY. By using the **main** socket the sandbox user accesses the pre-seeded passphrase cache directly.
+
+**Headless pinentry fallback:** If the cache is ever invalidated (agent restart, TTL expiry), `gpg-agent` invokes the custom `pinentry-openshell` script. This script reads the passphrase from `/run/openshell-gpg/passphrase` (a root-only file) and responds using the Assuan pinentry protocol, so signing succeeds without any TTY.
+
+**Private key isolation:** After key import the entire `/sandbox/.gnupg/` tree is `chown`ed to the sandbox user, **except** `private-keys-v1.d/` which stays `root:root 0700`. The sandbox user can list the directory (GnuPG needs the parent `0700` permission) but cannot read the `.key` files inside. The key material is passphrase-protected on disk regardless.
 
 ### Startup Lifecycle
 
@@ -1570,16 +1575,18 @@ sequenceDiagram
     SB->>SB: Extract GPG private key from file_secrets (before write_file_secrets)
     SB->>SB: write_file_secrets() writes remaining secrets to disk
     SB->>SB: start_gpg_agent_from_config(gpg_private_key)
-    SB->>SB: Create /run/openshell-gpg/private/ (root 0700)
-    SB->>SB: Create /sandbox/.gnupg/ (sandbox 0700)
-    SB->>SB: Write gpg-agent.conf (infinite cache, preset allowed)
-    SB->>GA: gpg-agent --daemon --homedir /run/openshell-gpg/private/
-    SB->>GA: gpg --import private-key.asc
+    SB->>SB: Create /sandbox/.gnupg/ (root 0700, chowned later)
+    SB->>SB: Install headless pinentry at /run/openshell-gpg/
+    SB->>SB: Write gpg-agent.conf (infinite cache, preset, pinentry-program)
+    SB->>SB: Write private key to temp file
+    SB->>GA: gpg-agent --daemon --homedir /sandbox/.gnupg/ (Stdio::null)
+    SB->>GA: gpg --import private-key.asc (then delete temp file)
     SB->>SB: get_all_keygrips() via gpg --with-keygrip --list-secret-keys
     SB->>GA: gpg-preset-passphrase --preset (for each keygrip, passphrase on stdin)
-    SB->>SB: Export public key and import into /sandbox/.gnupg/ keyring
-    SB->>SB: Write gpg.conf (no-autostart)
-    SB->>SB: Wait for extra socket at /sandbox/.gnupg/S.gpg-agent, chown to sandbox
+    SB->>SB: Lock private-keys-v1.d/ to root:root 0700
+    SB->>SB: chown_except_private_keys() to sandbox user
+    SB->>SB: Write gpg.conf (no-autostart), chown to sandbox
+    SB->>SB: Wait for main socket at /sandbox/.gnupg/S.gpg-agent
     SB->>SB: Write .gitconfig (if signing_key_id set)
     SB->>SB: Inject GNUPGHOME=/sandbox/.gnupg into provider_env
     SB->>SB: Add /sandbox/.gnupg to Landlock read_write
@@ -1587,7 +1594,7 @@ sequenceDiagram
     SB->>SB: Register agent PID as managed child
     Note over SB: Continue with proxy, namespace, child spawn...
     SB->>Child: exec (GNUPGHOME=/sandbox/.gnupg)
-    Child->>GA: gpg --sign (via extra socket)
+    Child->>GA: gpg --sign (via main socket, uses cached passphrase)
     GA-->>Child: Signature (private key never leaves agent)
 ```
 
@@ -1605,34 +1612,36 @@ sequenceDiagram
 **Inside `start_gpg_agent()`** (`crates/openshell-sandbox/src/gpg_agent.rs`):
 
 1. Verify `gpg`, `gpg-agent`, and `gpg-preset-passphrase` binaries are in PATH.
-2. Create `/run/openshell-gpg/private/` with mode 0700 (root-only).
-3. Create `/sandbox/.gnupg/` with mode 0700, `chown` to sandbox user.
-4. Write `gpg-agent.conf` with `allow-preset-passphrase` and infinite cache TTLs.
-5. Write private key to the private directory.
-6. Start `gpg-agent --daemon --homedir /run/openshell-gpg/private/`.
-7. Import the private key via `gpg --batch --import`.
+2. Create `/sandbox/.gnupg/` with mode 0700 (root-owned initially).
+3. Install headless pinentry: write passphrase to `/run/openshell-gpg/passphrase` (root 0600) and a shell script `pinentry-openshell` (0755) that speaks Assuan protocol and returns the passphrase on `GETPIN`.
+4. Write `gpg-agent.conf` with `allow-preset-passphrase`, `allow-loopback-pinentry`, `pinentry-program /run/openshell-gpg/pinentry-openshell`, and infinite cache TTLs.
+5. Write private key to a temporary file in `/sandbox/.gnupg/`.
+6. Start `gpg-agent --daemon --homedir /sandbox/.gnupg/` using `.status()` with `Stdio::null()` (not `.output()`, which would deadlock because the forked daemon inherits pipe FDs).
+7. Import the private key via `gpg --batch --import`, then delete the temporary key file.
 8. Extract all keygrips via `gpg --with-keygrip --list-secret-keys` (primary key + subkeys).
-9. Pre-seed the passphrase for each keygrip via `gpg-preset-passphrase --preset <keygrip>` with `GNUPGHOME` env var (passphrase piped on stdin).
-10. Export the public key and import it into the sandbox keyring at `/sandbox/.gnupg/` via `gpg --import`.
-11. Write `gpg.conf` with `no-autostart` to `/sandbox/.gnupg/`, `chown` to sandbox user.
-12. Wait for the extra socket at `/sandbox/.gnupg/S.gpg-agent` (created by gpg-agent via the `extra-socket` directive), then `chown` it to the sandbox user.
-13. If `signing_key_id` is set, write `/sandbox/.gitconfig` with `[user] signingkey` and `[commit] gpgsign = true`, `chown` to sandbox user.
-14. Read the agent PID via `gpg-connect-agent GETINFO pid /bye`.
-15. Return a `GpgAgentHandle` containing the PID and both directory paths.
+9. Pre-seed the passphrase for each keygrip via `gpg-preset-passphrase --preset <keygrip>` (passphrase piped on stdin).
+10. Lock `private-keys-v1.d/` to mode 0700 (stays root-owned).
+11. `chown_except_private_keys()`: recursively chown `/sandbox/.gnupg/` to the sandbox user, skipping `private-keys-v1.d/` and its contents.
+12. Write `gpg.conf` with `no-autostart` to `/sandbox/.gnupg/`, chown to sandbox user.
+13. Wait for the main socket at `/sandbox/.gnupg/S.gpg-agent`.
+14. If `signing_key_id` is set, write `/sandbox/.gitconfig` with `[user] signingkey` and `[commit] gpgsign = true`, chown to sandbox user.
+15. Read the agent PID via `gpg-connect-agent GETINFO pid /bye`.
+16. Return a `GpgAgentHandle` containing the PID and the gnupg directory path.
 
 ### Cleanup
 
-`GpgAgentHandle` implements `Drop`. When the sandbox supervisor exits (or the handle goes out of scope), the destructor calls `gpgconf --homedir /run/openshell-gpg/private/ --kill gpg-agent` to shut down the daemon. The `_gpg_agent_handle` variable in `run_sandbox()` keeps the handle alive for the duration of the sandbox session.
+`GpgAgentHandle` implements `Drop`. When the sandbox supervisor exits (or the handle goes out of scope), the destructor calls `gpgconf --homedir /sandbox/.gnupg/ --kill gpg-agent` to shut down the daemon. The `_gpg_agent_handle` variable in `run_sandbox()` keeps the handle alive for the duration of the sandbox session.
 
 ### Security Model
 
 | Threat | Mitigation |
 |--------|-----------|
-| Sandbox user reads private key | Private key is extracted from `file_secrets` before `write_file_secrets()` runs, so it never touches disk as sandbox-readable. It lives only in `/run/openshell-gpg/private/` (root 0700), which is not in any Landlock allow list. |
+| Sandbox user reads private key files | `private-keys-v1.d/` stays `root:root 0700` after `chown_except_private_keys()`. The sandbox user can see the directory exists but cannot read `.key` files. Key material is also passphrase-protected on disk. |
+| Sandbox user reads passphrase file | `/run/openshell-gpg/passphrase` is `root:root 0600`. The pinentry script runs as the agent (root), not the sandbox user. |
 | Sandbox user reads passphrase from env | `__OPENSHELL_GPG_PASSPHRASE` is removed from `provider_env` before the child process starts. |
 | Sandbox user attaches to gpg-agent via ptrace | Seccomp blocks `ptrace` and `process_vm_readv` syscalls. |
 | Sandbox user impersonates signing via raw socket | `gpg-agent` authenticates via the Unix socket protocol. The sandbox user can only request operations the agent permits (sign, encrypt). The agent holds the key but never exports it. |
-| Sandbox user starts own gpg-agent | `gpg.conf` includes `no-autostart`, and `GNUPGHOME` points to the sandbox-accessible directory which does not contain a private key. |
+| Sandbox user starts own gpg-agent | `gpg.conf` includes `no-autostart`. Even if a rogue agent started, it would lack the private key material (locked in `private-keys-v1.d/`). |
 | Competing GNUPGHOME from secret_mounts | Policy validation rejects `gpg_agent` when any `secret_mounts` entry targets a `.gnupg` path. |
 
 ### Static Field Enforcement
