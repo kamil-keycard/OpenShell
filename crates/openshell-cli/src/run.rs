@@ -1847,8 +1847,6 @@ pub async fn sandbox_create_with_bootstrap(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
-    secrets: &[String],
-    file_secrets: &[String],
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
@@ -1880,8 +1878,6 @@ pub async fn sandbox_create_with_bootstrap(
         remote,
         ssh_key,
         providers,
-        secrets,
-        file_secrets,
         policy,
         forward,
         command,
@@ -1937,8 +1933,6 @@ pub async fn sandbox_create(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
-    secrets: &[String],
-    file_secrets: &[String],
     policy: Option<&str>,
     forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
@@ -2022,36 +2016,8 @@ pub async fn sandbox_create(
     };
     let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
 
-    let parsed_secrets: HashMap<String, String> = secrets
-        .iter()
-        .filter_map(|s| {
-            let (key, value) = s.split_once('=')?;
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect();
-
-    let parsed_file_secrets: HashMap<String, String> = file_secrets
-        .iter()
-        .filter_map(|s| {
-            let (path, urn) = s.split_once('=')?;
-            if !Path::new(path).is_absolute() {
-                eprintln!("warning: --file-secret path must be absolute, skipping: {path}");
-                return None;
-            }
-            if !urn.starts_with("urn:secret-b64:") {
-                eprintln!(
-                    "warning: --file-secret URN must use urn:secret-b64: prefix, skipping: {urn}"
-                );
-                return None;
-            }
-            Some((path.to_string(), urn.to_string()))
-        })
-        .collect();
-
     let policy = load_sandbox_policy(policy)?;
 
-    // Collect secret env keys from both CLI flags and the policy so the
-    // inferred-provider filter knows which credentials are already covered.
     let policy_secret_keys: Vec<String> = policy
         .as_ref()
         .and_then(|p| p.secrets.as_ref())
@@ -2059,11 +2025,8 @@ pub async fn sandbox_create(
         .unwrap_or_default();
 
     let inferred_types: Vec<String> = {
-        let secret_keys: HashSet<&str> = parsed_secrets
-            .keys()
-            .map(String::as_str)
-            .chain(policy_secret_keys.iter().map(String::as_str))
-            .collect();
+        let secret_keys: HashSet<&str> =
+            policy_secret_keys.iter().map(String::as_str).collect();
         let registry = ProviderRegistry::new();
         inferred_provider_type(command)
             .into_iter()
@@ -2103,8 +2066,6 @@ pub async fn sandbox_create(
             gpu: requested_gpu,
             policy,
             providers: configured_providers,
-            secrets: parsed_secrets,
-            file_secrets: parsed_file_secrets,
             template,
             ..SandboxSpec::default()
         }),

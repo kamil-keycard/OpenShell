@@ -1141,18 +1141,6 @@ enum SandboxCommands {
         #[arg(long = "provider")]
         providers: Vec<String>,
 
-        /// Per-sandbox secret bindings resolved via Keycard token exchange.
-        /// Format: KEY=URN (e.g., ANTHROPIC_API_KEY=urn:resource:anthropic-api-key).
-        /// Requires a keycard provider to be attached.
-        #[arg(long = "secret")]
-        secrets: Vec<String>,
-
-        /// Per-sandbox file secret bindings mounted to the sandbox filesystem.
-        /// Format: PATH=URN (e.g., /sandbox/.ssh/id_ed25519=urn:secret-b64:ssh-key).
-        /// The URN must use the urn:secret-b64: prefix. Requires a keycard provider.
-        #[arg(long = "file-secret")]
-        file_secrets: Vec<String>,
-
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
@@ -2114,8 +2102,6 @@ async fn main() -> Result<()> {
                     remote,
                     ssh_key,
                     providers,
-                    secrets,
-                    file_secrets,
                     policy,
                     forward,
                     tty,
@@ -2198,8 +2184,6 @@ async fn main() -> Result<()> {
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
-                                &secrets,
-                                &file_secrets,
                                 policy.as_deref(),
                                 forward,
                                 &command,
@@ -2222,8 +2206,6 @@ async fn main() -> Result<()> {
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
-                                &secrets,
-                                &file_secrets,
                                 policy.as_deref(),
                                 forward,
                                 &command,
