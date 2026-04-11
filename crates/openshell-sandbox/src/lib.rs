@@ -1529,8 +1529,7 @@ fn write_file_secrets(
         }
 
         std::fs::write(path, content).into_diagnostic()?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .into_diagnostic()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).into_diagnostic()?;
         chown(path, uid, gid).into_diagnostic()?;
 
         debug!(

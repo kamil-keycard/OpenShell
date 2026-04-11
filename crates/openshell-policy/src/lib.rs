@@ -685,10 +685,7 @@ pub fn validate_sandbox_policy(
         }
         if mount.source_urn.is_empty() {
             violations.push(PolicyViolation::InvalidSecretMount {
-                reason: format!(
-                    "source_urn is empty for mount at '{}'",
-                    mount.target_path
-                ),
+                reason: format!("source_urn is empty for mount at '{}'", mount.target_path),
             });
         }
     }
@@ -1094,6 +1091,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            secret_mounts: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -1310,5 +1308,108 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn round_trip_preserves_secret_mounts() {
+        let yaml = r#"
+version: 1
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+  - source_urn: "urn:secret-b64:gpg-keyring"
+    target_path: "/sandbox/.gnupg/pubring.kbx"
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        assert_eq!(proto1.secret_mounts.len(), 2);
+        assert_eq!(proto1.secret_mounts[0].source_urn, "urn:secret-b64:ssh-key");
+        assert_eq!(
+            proto1.secret_mounts[0].target_path,
+            "/sandbox/.ssh/id_ed25519"
+        );
+        assert_eq!(proto1.secret_mounts[0].mode, "0600");
+        assert_eq!(proto1.secret_mounts[1].mode, "");
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto2.secret_mounts.len(), 2);
+        assert_eq!(
+            proto2.secret_mounts[0].source_urn,
+            proto1.secret_mounts[0].source_urn
+        );
+        assert_eq!(
+            proto2.secret_mounts[0].target_path,
+            proto1.secret_mounts[0].target_path
+        );
+    }
+
+    #[test]
+    fn secret_mounts_absent_parses_fine() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: example.com
+        port: 443
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        assert!(proto.secret_mounts.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_relative_secret_mount_path() {
+        let mut policy = restrictive_default_policy();
+        policy.secret_mounts.push(ProtoSecretMount {
+            source_urn: "urn:secret-b64:test".to_string(),
+            target_path: "relative/path".to_string(),
+            mode: String::new(),
+        });
+        let result = validate_sandbox_policy(&policy);
+        assert!(result.is_err());
+        let violations = result.unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidSecretMount { .. })),
+            "expected InvalidSecretMount violation"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_traversal_in_secret_mount() {
+        let mut policy = restrictive_default_policy();
+        policy.secret_mounts.push(ProtoSecretMount {
+            source_urn: "urn:secret-b64:test".to_string(),
+            target_path: "/sandbox/../etc/shadow".to_string(),
+            mode: String::new(),
+        });
+        let result = validate_sandbox_policy(&policy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_source_urn() {
+        let mut policy = restrictive_default_policy();
+        policy.secret_mounts.push(ProtoSecretMount {
+            source_urn: String::new(),
+            target_path: "/sandbox/.ssh/id_ed25519".to_string(),
+            mode: String::new(),
+        });
+        let result = validate_sandbox_policy(&policy);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_secret_mount() {
+        let mut policy = restrictive_default_policy();
+        policy.secret_mounts.push(ProtoSecretMount {
+            source_urn: "urn:secret-b64:ssh-key".to_string(),
+            target_path: "/sandbox/.ssh/id_ed25519".to_string(),
+            mode: "0600".to_string(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 }

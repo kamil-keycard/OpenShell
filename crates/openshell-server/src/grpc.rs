@@ -3965,13 +3965,11 @@ async fn resolve_file_secrets(
         })?;
 
         for (target_path, urn) in file_secrets {
-            let resource_urn = urn
-                .strip_prefix(FILE_SECRET_URN_PREFIX)
-                .ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "file_secret URN must start with '{FILE_SECRET_URN_PREFIX}': '{urn}'"
-                    ))
-                })?;
+            let resource_urn = urn.strip_prefix(FILE_SECRET_URN_PREFIX).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "file_secret URN must start with '{FILE_SECRET_URN_PREFIX}': '{urn}'"
+                ))
+            })?;
 
             let b64_content = kc_client
                 .exchange_token(&kc_creds.client_id, &kc_creds.client_secret, resource_urn)
@@ -6554,6 +6552,70 @@ mod tests {
         let err = validate_sandbox_spec("ok", &spec).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("secrets"));
+    }
+
+    // ---- File secret validation tests ----
+
+    #[test]
+    fn validate_sandbox_spec_accepts_valid_file_secrets() {
+        let spec = SandboxSpec {
+            file_secrets: [(
+                "/sandbox/.ssh/id_ed25519".to_string(),
+                "urn:secret-b64:ssh-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("ok", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_relative_file_secret_path() {
+        let spec = SandboxSpec {
+            file_secrets: [(
+                "relative/path".to_string(),
+                "urn:secret-b64:test".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("absolute"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_traversal_in_file_secret_path() {
+        let spec = SandboxSpec {
+            file_secrets: [(
+                "/sandbox/../etc/shadow".to_string(),
+                "urn:secret-b64:test".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains(".."));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_wrong_urn_prefix() {
+        let spec = SandboxSpec {
+            file_secrets: [(
+                "/sandbox/.ssh/id_ed25519".to_string(),
+                "urn:resource:ssh-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("urn:secret-b64:"));
     }
 
     // ---- Provider field limit tests ----

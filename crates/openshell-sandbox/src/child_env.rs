@@ -41,15 +41,13 @@ pub(crate) fn tls_env_vars(
 /// configuration. `IdentitiesOnly=yes` prevents the SSH agent from offering
 /// other keys.
 pub(crate) fn ssh_env_vars(key_path: &Path) -> [(&'static str, String); 1] {
-    [
-        (
-            "GIT_SSH_COMMAND",
-            format!(
-                "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no",
-                key_path.display()
-            ),
+    [(
+        "GIT_SSH_COMMAND",
+        format!(
+            "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no",
+            key_path.display()
         ),
-    ]
+    )]
 }
 
 /// Companion env vars for a mounted GPG home directory.
@@ -101,5 +99,24 @@ mod tests {
 
         assert!(stdout.contains("NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem"));
         assert!(stdout.contains("SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem"));
+    }
+
+    #[test]
+    fn ssh_env_vars_sets_git_ssh_command() {
+        let key_path = Path::new("/sandbox/.ssh/id_ed25519");
+        let vars = ssh_env_vars(key_path);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].0, "GIT_SSH_COMMAND");
+        assert!(vars[0].1.contains("/sandbox/.ssh/id_ed25519"));
+        assert!(vars[0].1.contains("IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn gpg_env_vars_sets_gnupghome() {
+        let dir_path = Path::new("/sandbox/.gnupg");
+        let vars = gpg_env_vars(dir_path);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].0, "GNUPGHOME");
+        assert_eq!(vars[0].1, "/sandbox/.gnupg");
     }
 }
