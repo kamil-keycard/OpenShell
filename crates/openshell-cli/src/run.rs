@@ -2048,8 +2048,22 @@ pub async fn sandbox_create(
         })
         .collect();
 
+    let policy = load_sandbox_policy(policy)?;
+
+    // Collect secret env keys from both CLI flags and the policy so the
+    // inferred-provider filter knows which credentials are already covered.
+    let policy_secret_keys: Vec<String> = policy
+        .as_ref()
+        .and_then(|p| p.secrets.as_ref())
+        .map(|s| s.env.keys().cloned().collect())
+        .unwrap_or_default();
+
     let inferred_types: Vec<String> = {
-        let secret_keys: HashSet<&str> = parsed_secrets.keys().map(String::as_str).collect();
+        let secret_keys: HashSet<&str> = parsed_secrets
+            .keys()
+            .map(String::as_str)
+            .chain(policy_secret_keys.iter().map(String::as_str))
+            .collect();
         let registry = ProviderRegistry::new();
         inferred_provider_type(command)
             .into_iter()
@@ -2060,15 +2074,24 @@ pub async fn sandbox_create(
             .collect()
     };
 
+    // If the policy declares a secrets.provider, include it in the explicit
+    // provider list so ensure_required_providers validates it exists.
+    let mut providers = providers.to_vec();
+    if let Some(ref p) = policy {
+        if let Some(ref secrets) = p.secrets {
+            if !secrets.provider.is_empty() && !providers.contains(&secrets.provider) {
+                providers.push(secrets.provider.clone());
+            }
+        }
+    }
+
     let configured_providers = ensure_required_providers(
         &mut client,
-        providers,
+        &providers,
         &inferred_types,
         auto_providers_override,
     )
     .await?;
-
-    let policy = load_sandbox_policy(policy)?;
 
     let template = image.map(|img| SandboxTemplate {
         image: img,
