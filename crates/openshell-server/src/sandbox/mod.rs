@@ -348,53 +348,59 @@ pub fn spawn_sandbox_watcher(
     info!(namespace = %namespace, "Starting sandbox watcher");
 
     tokio::spawn(async move {
-        let api = client.api();
-        let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
-
         loop {
-            match stream.try_next().await {
-                Ok(Some(event)) => match event {
-                    Event::Applied(obj) => {
-                        let obj_name = obj.metadata.name.clone().unwrap_or_default();
-                        debug!(sandbox_name = %obj_name, "Received Applied event from Kubernetes");
-                        if let Err(err) =
-                            handle_applied(&store, &client, &index, &watch_bus, obj).await
-                        {
-                            warn!(sandbox_name = %obj_name, error = %err, "Failed to apply sandbox update");
-                        }
-                    }
-                    Event::Deleted(obj) => {
-                        let obj_name = obj.metadata.name.clone().unwrap_or_default();
-                        debug!(sandbox_name = %obj_name, "Received Deleted event from Kubernetes");
-                        if let Err(err) =
-                            handle_deleted(&store, &index, &watch_bus, &tracing_log_bus, obj).await
-                        {
-                            warn!(sandbox_name = %obj_name, error = %err, "Failed to delete sandbox record");
-                        }
-                    }
-                    Event::Restarted(objs) => {
-                        info!(
-                            count = objs.len(),
-                            "Sandbox watcher restarted, re-syncing sandboxes"
-                        );
-                        for obj in objs {
+            let api = client.api();
+            let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(event)) => match event {
+                        Event::Applied(obj) => {
                             let obj_name = obj.metadata.name.clone().unwrap_or_default();
+                            debug!(sandbox_name = %obj_name, "Received Applied event from Kubernetes");
                             if let Err(err) =
                                 handle_applied(&store, &client, &index, &watch_bus, obj).await
                             {
-                                warn!(sandbox_name = %obj_name, error = %err, "Failed to apply sandbox update during resync");
+                                warn!(sandbox_name = %obj_name, error = %err, "Failed to apply sandbox update");
                             }
                         }
+                        Event::Deleted(obj) => {
+                            let obj_name = obj.metadata.name.clone().unwrap_or_default();
+                            debug!(sandbox_name = %obj_name, "Received Deleted event from Kubernetes");
+                            if let Err(err) =
+                                handle_deleted(&store, &index, &watch_bus, &tracing_log_bus, obj)
+                                    .await
+                            {
+                                warn!(sandbox_name = %obj_name, error = %err, "Failed to delete sandbox record");
+                            }
+                        }
+                        Event::Restarted(objs) => {
+                            info!(
+                                count = objs.len(),
+                                "Sandbox watcher restarted, re-syncing sandboxes"
+                            );
+                            for obj in objs {
+                                let obj_name = obj.metadata.name.clone().unwrap_or_default();
+                                if let Err(err) =
+                                    handle_applied(&store, &client, &index, &watch_bus, obj).await
+                                {
+                                    warn!(sandbox_name = %obj_name, error = %err, "Failed to apply sandbox update during resync");
+                                }
+                            }
+                        }
+                    },
+                    Ok(None) => {
+                        warn!("Sandbox watcher stream ended, reconnecting in 5s");
+                        break;
                     }
-                },
-                Ok(None) => {
-                    warn!("Sandbox watcher stream ended unexpectedly");
-                    break;
-                }
-                Err(err) => {
-                    warn!(error = %err, "Sandbox watcher error");
+                    Err(err) => {
+                        warn!(error = %err, "Sandbox watcher error, reconnecting in 5s");
+                        break;
+                    }
                 }
             }
+
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 }

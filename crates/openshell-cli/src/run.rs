@@ -1960,9 +1960,14 @@ pub async fn sandbox_create(
     //   - the user passed --no-bootstrap
     //   - an existing gateway was already resolved (don't replace it)
     //   - we already bootstrapped once (don't double-bootstrap)
+    eprint!("{} Connecting to gateway...", "⧖".dimmed());
     let (mut client, effective_server, effective_tls) = match grpc_client(server, tls).await {
-        Ok(c) => (c, server.to_string(), tls.clone()),
+        Ok(c) => {
+            eprint!("\r\x1b[2K");
+            (c, server.to_string(), tls.clone())
+        }
         Err(err) => {
+            eprint!("\r\x1b[2K");
             if !crate::bootstrap::should_attempt_bootstrap(&err, tls) {
                 return Err(err);
             }
@@ -2047,6 +2052,7 @@ pub async fn sandbox_create(
         }
     }
 
+    eprint!("{} Checking providers...", "⧖".dimmed());
     let configured_providers = ensure_required_providers(
         &mut client,
         &providers,
@@ -2054,6 +2060,7 @@ pub async fn sandbox_create(
         auto_providers_override,
     )
     .await?;
+    eprint!("\r\x1b[2K");
 
     let template = image.map(|img| SandboxTemplate {
         image: img,
@@ -2071,6 +2078,7 @@ pub async fn sandbox_create(
         name: name.unwrap_or_default().to_string(),
     };
 
+    eprint!("{} Creating sandbox...", "⧖".dimmed());
     let response = match client.create_sandbox(request).await {
         Ok(resp) => resp,
         Err(status) if status.code() == Code::AlreadyExists => {
@@ -2081,6 +2089,7 @@ pub async fn sandbox_create(
         }
         Err(status) => return Err(status).into_diagnostic(),
     };
+    eprint!("\r\x1b[2K");
     let sandbox = response
         .into_inner()
         .sandbox

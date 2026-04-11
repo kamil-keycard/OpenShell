@@ -11,7 +11,7 @@ use k8s_openapi::api::core::v1::Event as KubeEventObj;
 use kube::Client;
 use kube::api::Api;
 use kube::runtime::watcher::{self, Event};
-use openshell_core::proto::{PlatformEvent, SandboxStreamEvent};
+use openshell_core::proto::{PlatformEvent, Sandbox, SandboxStreamEvent};
 use tokio::sync::broadcast;
 use tonic::Status;
 use tracing::{debug, warn};
@@ -73,49 +73,54 @@ impl SandboxWatchBus {
 /// This tailer publishes platform events (sourced from Kubernetes) into per-sandbox broadcast streams.
 pub fn spawn_kube_event_tailer(state: Arc<ServerState>) {
     tokio::spawn(async move {
-        let client = match Client::try_default().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "Failed to create kube client for event tailer");
-                return;
-            }
-        };
-
         let ns = state.config.sandbox_namespace.clone();
-        let api: Api<KubeEventObj> = Api::namespaced(client, &ns);
-
-        // We don't have a stable label to select Events by sandbox id.
-        // Instead, we watch all Events in the namespace and dispatch using the in-memory index.
-        // This is best-effort and efficient enough for typical sandbox counts.
-        let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
 
         loop {
-            match stream.try_next().await {
-                Ok(Some(Event::Applied(obj))) => {
-                    if let Some((sandbox_id, evt)) = map_kube_event_to_platform(&state, &obj) {
-                        state
-                            .tracing_log_bus
-                            .platform_event_bus
-                            .publish(&sandbox_id, evt);
+            let client = match Client::try_default().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "Failed to create kube client for event tailer, retrying in 5s");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let api: Api<KubeEventObj> = Api::namespaced(client, &ns);
+            let mut stream = watcher::watcher(api, watcher::Config::default()).boxed();
+
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(Event::Applied(obj))) => {
+                        if let Some((sandbox_id, evt)) =
+                            map_kube_event_to_platform(&state, &obj).await
+                        {
+                            state
+                                .tracing_log_bus
+                                .platform_event_bus
+                                .publish(&sandbox_id, evt);
+                        }
+                    }
+                    Ok(Some(Event::Deleted(_))) => {}
+                    Ok(Some(Event::Restarted(_))) => {
+                        debug!(namespace = %ns, "Kubernetes event watcher restarted");
+                    }
+                    Ok(None) => {
+                        warn!(namespace = %ns, "Kubernetes event watcher stream ended, reconnecting in 5s");
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(namespace = %ns, error = %err, "Kubernetes event watcher error, reconnecting in 5s");
+                        break;
                     }
                 }
-                Ok(Some(Event::Deleted(_))) => {}
-                Ok(Some(Event::Restarted(_))) => {
-                    debug!(namespace = %ns, "Kubernetes event watcher restarted");
-                }
-                Ok(None) => {
-                    warn!(namespace = %ns, "Kubernetes event watcher stream ended");
-                    break;
-                }
-                Err(err) => {
-                    warn!(namespace = %ns, error = %err, "Kubernetes event watcher error");
-                }
             }
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
 }
 
-fn map_kube_event_to_platform(
+async fn map_kube_event_to_platform(
     state: &ServerState,
     obj: &KubeEventObj,
 ) -> Option<(String, SandboxStreamEvent)> {
@@ -124,16 +129,30 @@ fn map_kube_event_to_platform(
     let involved_name = involved.name.unwrap_or_default();
 
     let sandbox_id = match involved_kind.as_str() {
-        "Sandbox" => state
-            .sandbox_index
-            .sandbox_id_for_sandbox_name(&involved_name)?,
-        "Pod" => {
-            // The sandbox controller creates pods with the same name as the sandbox,
-            // so try looking up by sandbox name first, then fall back to agent_pod index.
-            state
+        "Sandbox" | "Pod" => {
+            // Try the in-memory index first (fast path).
+            let from_index = state
                 .sandbox_index
                 .sandbox_id_for_sandbox_name(&involved_name)
-                .or_else(|| state.sandbox_index.sandbox_id_for_agent_pod(&involved_name))?
+                .or_else(|| state.sandbox_index.sandbox_id_for_agent_pod(&involved_name));
+
+            match from_index {
+                Some(id) => id,
+                None => {
+                    // Index miss — the sandbox CRD watcher may not have indexed
+                    // this sandbox yet. Fall back to a direct store lookup so we
+                    // don't silently drop early K8s events (Scheduled, Pulling, …).
+                    debug!(
+                        involved_name = %involved_name,
+                        involved_kind = %involved_kind,
+                        "Index miss for kube event, trying store fallback"
+                    );
+                    match state.store.get_message_by_name::<Sandbox>(&involved_name).await {
+                        Ok(Some(sb)) => sb.id,
+                        _ => return None,
+                    }
+                }
+            }
         }
         _ => return None,
     };
