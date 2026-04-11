@@ -49,7 +49,7 @@ pub use crate::docker::{
     DockerPreflight, ExistingGatewayInfo, check_docker_available, create_ssh_docker_client,
 };
 pub use crate::metadata::{
-    GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
+    ExposedDir, GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
     extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
     load_gateway_metadata, load_last_sandbox, remove_gateway_metadata, resolve_ssh_hostname,
     save_active_gateway, save_last_sandbox, store_gateway_metadata,
@@ -123,6 +123,9 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
+    /// Host directories to expose into the K3s container via bind mounts.
+    /// Each entry is an absolute path on the user's host machine.
+    pub expose: Vec<String>,
 }
 
 impl DeployOptions {
@@ -139,6 +142,7 @@ impl DeployOptions {
             registry_token: None,
             gpu: vec![],
             recreate: false,
+            expose: vec![],
         }
     }
 
@@ -208,6 +212,13 @@ impl DeployOptions {
         self.recreate = recreate;
         self
     }
+
+    /// Set host directories to expose into the K3s container.
+    #[must_use]
+    pub fn with_expose(mut self, expose: Vec<String>) -> Self {
+        self.expose = expose;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +283,7 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
+    let expose = options.expose;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -440,6 +452,33 @@ where
     // being created. If any subsequent step fails, we must clean up to avoid
     // leaving an orphaned volume in a corrupted state that blocks retries.
     // See: https://github.com/NVIDIA/OpenShell/issues/463
+    // Compute exposed directory mappings: host path → container path.
+    // The container path is derived as /host-<basename> to keep it readable.
+    // Basename collisions are rejected.
+    let exposed_dirs: Vec<metadata::ExposedDir> = {
+        let mut dirs = Vec::new();
+        let mut used_basenames = std::collections::HashSet::new();
+        for host_path in &expose {
+            let canonical = std::fs::canonicalize(host_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(host_path));
+            let basename = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "root".to_string());
+            if !used_basenames.insert(basename.clone()) {
+                return Err(miette::miette!(
+                    "duplicate --expose basename '{basename}': two directories have the same \
+                     name. Rename one or use distinct directories."
+                ));
+            }
+            dirs.push(metadata::ExposedDir {
+                host_path: canonical.to_string_lossy().to_string(),
+                container_path: format!("/host-{basename}"),
+            });
+        }
+        dirs
+    };
+
     let deploy_result: Result<GatewayMetadata> = async {
         let device_ids = resolve_gpu_device_ids(&gpu, cdi_supported);
         // ensure_container returns the actual host port — which may differ from
@@ -458,6 +497,7 @@ where
             registry_token.as_deref(),
             &device_ids,
             resume,
+            &exposed_dirs,
         )
         .await?;
         let port = actual_port;
@@ -556,13 +596,14 @@ where
         }
 
         // Create and store gateway metadata.
-        let metadata = create_gateway_metadata_with_host(
+        let mut metadata = create_gateway_metadata_with_host(
             &name,
             remote_opts.as_ref(),
             port,
             ssh_gateway_host.as_deref(),
             disable_tls,
         );
+        metadata.exposed_dirs = exposed_dirs.clone();
         store_gateway_metadata(&name, &metadata)?;
 
         Ok(metadata)

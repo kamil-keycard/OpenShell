@@ -94,6 +94,9 @@ server:
   # to this IP, allowing them to reach services running on the Docker host.
   # Auto-detected by the cluster entrypoint script.
   hostGatewayIP: ""
+  # Comma-separated list of allowed host-path prefixes for bind mounts.
+  # Set automatically by `gateway start --expose`.
+  allowedHostPaths: ""
   # Disable gateway authentication (mTLS client certificate requirement).
   # Set to true when the gateway sits behind a reverse proxy (e.g.
   # Cloudflare Tunnel) that terminates TLS.

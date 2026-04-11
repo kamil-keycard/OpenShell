@@ -519,6 +519,15 @@ else
     sed -i "s|hostGatewayIP: __HOST_GATEWAY_IP__|hostGatewayIP: \"\"|g" "$HELMCHART"
 fi
 
+# Inject allowed host path prefixes into the HelmChart manifest so the server
+# can validate host_mounts in sandbox policies.
+if [ -n "$OPENSHELL_ALLOWED_HOST_PATHS" ] && [ -f "$HELMCHART" ]; then
+    echo "Setting allowed host paths: $OPENSHELL_ALLOWED_HOST_PATHS"
+    sed -i "s|__ALLOWED_HOST_PATHS__|${OPENSHELL_ALLOWED_HOST_PATHS}|g" "$HELMCHART"
+else
+    sed -i "s|allowedHostPaths: __ALLOWED_HOST_PATHS__|allowedHostPaths: \"\"|g" "$HELMCHART"
+fi
+
 # Inject chart checksum into the HelmChart manifest so that a changed chart
 # tarball causes the HelmChart CR spec to differ, forcing the k3s Helm
 # controller to upgrade the release.

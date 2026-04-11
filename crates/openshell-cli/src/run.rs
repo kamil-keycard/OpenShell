@@ -1022,6 +1022,7 @@ pub async fn gateway_add(
             auth_mode: Some("mtls".to_string()),
             edge_team_domain: None,
             edge_auth_url: None,
+            exposed_dirs: Vec::new(),
         };
 
         store_gateway_metadata(name, &metadata)?;
@@ -1051,6 +1052,7 @@ pub async fn gateway_add(
             auth_mode: Some("cloudflare_jwt".to_string()),
             edge_team_domain: None,
             edge_auth_url: None,
+            exposed_dirs: Vec::new(),
         };
 
         store_gateway_metadata(name, &metadata)?;
@@ -1356,6 +1358,7 @@ pub async fn gateway_admin_deploy(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
+    expose: Vec<String>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -1409,7 +1412,8 @@ pub async fn gateway_admin_deploy(
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
-        .with_recreate(recreate);
+        .with_recreate(recreate)
+        .with_expose(expose);
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }

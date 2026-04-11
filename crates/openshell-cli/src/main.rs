@@ -817,6 +817,18 @@ enum GatewayCommands {
         /// (`--gpus all`) otherwise.
         #[arg(long)]
         gpu: bool,
+
+        /// Expose a host directory into the gateway for bind-mount file sharing.
+        ///
+        /// The given directory on the host is mounted into the K3s cluster
+        /// container at /host-<basename>. Sandbox policies can then declare
+        /// `host_mounts` referencing these paths. Multiple directories can be
+        /// exposed by repeating this flag.
+        ///
+        /// Requires `--recreate` when changing exposed directories on an
+        /// existing gateway (Docker does not support hot-adding bind mounts).
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        expose: Vec<String>,
     },
 
     /// Stop the gateway (preserves state).
@@ -1579,6 +1591,7 @@ async fn main() -> Result<()> {
                 registry_username,
                 registry_token,
                 gpu,
+                expose,
             } => {
                 let gpu = if gpu {
                     vec!["auto".to_string()]
@@ -1597,6 +1610,7 @@ async fn main() -> Result<()> {
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
+                    expose,
                 )
                 .await?;
             }

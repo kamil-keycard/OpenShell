@@ -45,6 +45,20 @@ pub struct GatewayMetadata {
         alias = "cf_auth_url"
     )]
     pub edge_auth_url: Option<String>,
+
+    /// Exposed host directories. Each entry maps a user-side host path
+    /// to the corresponding path inside the K3s container.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed_dirs: Vec<ExposedDir>,
+}
+
+/// A host directory exposed into the K3s cluster container via `--expose`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExposedDir {
+    /// Absolute path on the user's host machine.
+    pub host_path: String,
+    /// Corresponding absolute path inside the K3s container.
+    pub container_path: String,
 }
 
 impl GatewayMetadata {
@@ -135,6 +149,7 @@ pub fn create_gateway_metadata_with_host(
         auth_mode: None,
         edge_team_domain: None,
         edge_auth_url: None,
+        exposed_dirs: Vec::new(),
     }
 }
 
@@ -463,6 +478,7 @@ mod tests {
             auth_mode: None,
             edge_team_domain: None,
             edge_auth_url: None,
+            exposed_dirs: Vec::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -556,6 +572,7 @@ mod tests {
             auth_mode: None,
             edge_team_domain: None,
             edge_auth_url: None,
+            exposed_dirs: Vec::new(),
         };
         assert_eq!(meta.gateway_host(), None);
     }
@@ -571,6 +588,7 @@ mod tests {
             resolved_host: Some("10.0.0.5".into()),
             auth_mode: None,
             edge_team_domain: None,
+            exposed_dirs: Vec::new(),
             edge_auth_url: None,
         };
         assert_eq!(meta.gateway_host(), Some("10.0.0.5"));

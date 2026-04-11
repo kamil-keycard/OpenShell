@@ -76,6 +76,10 @@ spec:
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
+            {{- if .Values.server.allowedHostPaths }}
+            - name: OPENSHELL_ALLOWED_HOST_PATHS
+              value: {{ .Values.server.allowedHostPaths | quote }}
+            {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:

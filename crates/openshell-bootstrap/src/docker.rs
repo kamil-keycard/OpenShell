@@ -483,6 +483,7 @@ pub async fn ensure_container(
     registry_token: Option<&str>,
     device_ids: &[String],
     resume: bool,
+    exposed_dirs: &[crate::metadata::ExposedDir],
 ) -> Result<u16> {
     let container_name = container_name(name);
 
@@ -594,7 +595,13 @@ pub async fn ensure_container(
         // container's namespace, causing kubelet ContainerManager to fail.
         cgroupns_mode: Some(HostConfigCgroupnsModeEnum::HOST),
         port_bindings: Some(port_bindings),
-        binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
+        binds: Some({
+            let mut binds = vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))];
+            for dir in exposed_dirs {
+                binds.push(format!("{}:{}", dir.host_path, dir.container_path));
+            }
+            binds
+        }),
         network_mode: Some(network_name(name)),
         // Automatically restart the container when Docker restarts, unless the
         // user explicitly stopped it with `gateway stop`.
@@ -718,6 +725,17 @@ pub async fn ensure_container(
         // The NodePort is mapped to the configured host port, so the SSH
         // gateway port for remote clusters must match.
         env_vars.push(format!("SSH_GATEWAY_PORT={gateway_port}"));
+    }
+
+    if !exposed_dirs.is_empty() {
+        let container_paths: Vec<&str> = exposed_dirs
+            .iter()
+            .map(|d| d.container_path.as_str())
+            .collect();
+        env_vars.push(format!(
+            "OPENSHELL_ALLOWED_HOST_PATHS={}",
+            container_paths.join(",")
+        ));
     }
 
     // Pass image configuration to the cluster entrypoint.
