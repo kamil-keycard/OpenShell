@@ -36,7 +36,8 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
-| `child_env.rs` | Companion environment variable builders for proxy, TLS, file secret mounts (SSH, GPG) |
+| `gpg_agent.rs` | GPG agent lifecycle: split-directory setup, daemon spawn, key import, passphrase pre-seed, socket symlink, `GpgAgentHandle` with drop-based cleanup |
+| `child_env.rs` | Companion environment variable builders for proxy, TLS, file secret mounts (SSH, GPG), and GPG agent signing |
 | `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
 ## Startup and Orchestration
@@ -60,8 +61,11 @@ flowchart TD
     G --> H[prepare_filesystem]
     H --> H1{File secrets?}
     H1 -- Yes --> H2[Write file secrets to disk<br/>Inject Landlock read_only paths<br/>Inject companion env vars]
-    H1 -- No --> I{Proxy mode?}
-    H2 --> I{Proxy mode?}
+    H1 -- No --> H3{GPG agent configured?}
+    H2 --> H3{GPG agent configured?}
+    H3 -- Yes --> H4[Start gpg-agent daemon<br/>Split directory layout<br/>Inject GNUPGHOME + Landlock paths<br/>Scrub passphrase from env]
+    H3 -- No --> I{Proxy mode?}
+    H4 --> I{Proxy mode?}
     I -- Yes --> J[Generate ephemeral CA + write TLS files]
     J --> K[Create network namespace]
     K --> K1[Install bypass detection rules]
@@ -89,7 +93,7 @@ flowchart TD
    - Priority 1: `--policy-rules` + `--policy-data` provided -- load OPA engine from local Rego file and YAML data file via `OpaEngine::from_files()`. Query `query_sandbox_config()` for filesystem/landlock/process settings. Network mode forced to `Proxy`.
    - Priority 2: `--sandbox-id` + `--openshell-endpoint` provided -- fetch typed proto policy via `grpc_client::fetch_policy()`. Create OPA engine via `OpaEngine::from_proto()` using baked-in Rego rules. Convert proto to `SandboxPolicy` via `TryFrom`, which always forces `NetworkMode::Proxy` so that all egress passes through the proxy and the `inference.local` virtual host is always addressable.
    - Neither present: return fatal error.
-   - Output: `(SandboxPolicy, Option<Arc<OpaEngine>>)`
+   - Output: `(SandboxPolicy, Option<Arc<OpaEngine>>, Option<GpgAgentConfig>)` — the GPG agent config (if present) is extracted from the proto before conversion so the supervisor can set up the agent later.
 
 2. **Provider environment and file secrets fetching**: If sandbox ID and endpoint are available, call `grpc_client::fetch_provider_environment()` to get a `ProviderEnvironment` containing both `env_vars: HashMap<String, String>` (credential environment variables) and `file_secrets: HashMap<String, Vec<u8>>` (resolved file secret contents keyed by target path). On failure, log a warning and continue with empty maps. See `crates/openshell-sandbox/src/grpc_client.rs` -- `ProviderEnvironment`.
 
@@ -99,37 +103,39 @@ flowchart TD
 
 5. **File secret writing** (if file secrets are present): Write resolved file secrets to disk, inject Landlock paths, and set companion env vars. See [File Secret Mounts](#file-secret-mounts) for details.
 
-6. **TLS state for L7 inspection** (proxy mode only):
+6. **GPG agent startup** (if `gpg_agent` block is present in policy): `start_gpg_agent_from_config()` reads the private key from file secrets and passphrase from provider env, starts the agent daemon, injects `GNUPGHOME` into provider env, adds `/sandbox/.gnupg` to Landlock `read_write`, scrubs the passphrase from env, and registers the agent PID as a managed child. On failure, logs a warning and continues without signing support. See [GPG Agent (Commit Signing)](#gpg-agent-commit-signing) for details.
+
+7. **TLS state for L7 inspection** (proxy mode only):
    - Generate ephemeral CA via `SandboxCa::generate()` using `rcgen`
    - Write CA cert PEM and combined bundle (system CAs + sandbox CA) to `/etc/openshell-tls/`
    - Add the TLS directory to `policy.filesystem.read_only` so Landlock allows the child to read it
    - Build upstream `ClientConfig` with Mozilla root CAs via `webpki_roots`
    - Create `Arc<ProxyTlsState>` wrapping a `CertCache` and the upstream config
 
-7. **Network namespace** (Linux, proxy mode only):
+8. **Network namespace** (Linux, proxy mode only):
    - `NetworkNamespace::create()` builds the veth pair and namespace
    - Opens `/var/run/netns/sandbox-{uuid}` as an FD for later `setns()`
    - `install_bypass_rules(proxy_port)` installs iptables OUTPUT chain rules for bypass detection (fast-fail UX + diagnostic logging). See [Bypass detection](#bypass-detection).
    - On failure: return a fatal startup error (fail-closed). Bypass rule failure is non-fatal (logged as warning).
 
-8. **Proxy startup** (proxy mode only):
+9. **Proxy startup** (proxy mode only):
    - Validate that OPA engine and identity cache are present
    - Determine bind address: on Linux, use the netns veth host IP (netns creation is required and startup already aborted if it failed); on non-Linux, use `policy.network.proxy.http_addr`
    - Build `InferenceContext` via `build_inference_context()` which resolves routes from one of two sources (see [Inference routing context](#inference-routing-context) below)
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
 
-9. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
+10. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
 
-10. **Child process spawning** (`ProcessHandle::spawn()`):
+11. **Child process spawning** (`ProcessHandle::spawn()`):
     - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
     - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
     - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
-11. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
+12. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-12. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+13. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
 
-13. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
+14. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
@@ -1484,6 +1490,172 @@ Companion env vars use `entry().or_insert()` so they do not override values alre
 
 ---
 
+## GPG Agent (Commit Signing)
+
+The sandbox supports first-party GPG agent integration that enables `git commit -S` signing inside sandboxes while keeping private key material completely out of the sandbox user's reach. The supervisor spawns a `gpg-agent` daemon with a split directory layout that uses Landlock for privilege separation.
+
+**Files:** `crates/openshell-sandbox/src/gpg_agent.rs` (agent lifecycle), `crates/openshell-policy/src/lib.rs` (`GpgAgentDef` serde type, validation), `crates/openshell-server/src/grpc.rs` (secret extraction, static field enforcement), `crates/openshell-sandbox/src/child_env.rs` (`gpg_agent_env_vars()`), `proto/sandbox.proto` (`GpgAgentConfig` message)
+
+### Policy Declaration
+
+The `gpg_agent` block is a top-level field in the policy YAML:
+
+```yaml
+gpg_agent:
+  private_key_urn: "urn:secret-b64:gpg-private-key"
+  passphrase_urn: "urn:secret:gpg-passphrase"
+  signing_key_id: "ABCDEF1234567890"
+```
+
+| Field | Required | Scheme | Purpose |
+|-------|----------|--------|---------|
+| `private_key_urn` | Yes | `urn:secret-b64:` | Keycard URN for the ASCII-armored GPG private key (base64-encoded file secret) |
+| `passphrase_urn` | Yes | `urn:secret:` | Keycard URN for the passphrase that unlocks the private key (env-style secret) |
+| `signing_key_id` | No | — | GPG key ID (long form). When set, supervisor writes `user.signingkey` and `commit.gpgsign=true` to `/sandbox/.gitconfig` |
+
+### Validation Rules
+
+Policy validation in `validate_sandbox_policy()` (`crates/openshell-policy/src/lib.rs`) enforces:
+
+- Both `private_key_urn` and `passphrase_urn` are required (non-empty).
+- `private_key_urn` must use the `urn:secret-b64:` scheme (file secret, base64-encoded).
+- `passphrase_urn` must use the `urn:secret:` scheme (env secret).
+- Any `secret_mounts` entry targeting a `.gnupg` path conflicts with `gpg_agent` and is rejected (competing GNUPGHOME ownership).
+- The `gpg_agent` block uses `deny_unknown_fields` for strict YAML parsing.
+
+### Gateway Secret Extraction
+
+`extract_policy_secrets()` in `crates/openshell-server/src/grpc.rs` maps the `gpg_agent` URNs into the standard secret resolution pipeline:
+
+1. `gpg.private_key_urn` is inserted into `SandboxSpec.file_secrets` at the well-known path `/var/lib/openshell/gpg/private-key.asc`. This causes the gateway to resolve it via Keycard (base64-decode, 256KB limit) and deliver it alongside other file secrets.
+2. `gpg.passphrase_urn` is inserted into `SandboxSpec.secrets` under the internal key `__OPENSHELL_GPG_PASSPHRASE`. This causes the gateway to resolve it as an env-var secret delivered in `GetSandboxProviderEnvironmentResponse.env_vars`.
+
+### Split Directory Layout
+
+The agent uses two directories with strict privilege separation:
+
+```text
+/run/openshell-gpg/private/           (root:root 0700)
+  ├── gpg-agent.conf                  (allow-preset-passphrase, infinite cache TTL)
+  ├── private-key.asc                 (imported into keyring)
+  ├── pubring.kbx                     (full keyring)
+  ├── private-keys-v1.d/              (GPG private key storage)
+  └── S.gpg-agent                     (Unix domain socket)
+
+/sandbox/.gnupg/                      (sandbox:sandbox 0700)
+  ├── pubring.kbx                     (copy of public keyring only)
+  ├── gpg.conf                        (no-autostart)
+  └── S.gpg-agent                     (symlink → /run/openshell-gpg/private/S.gpg-agent)
+```
+
+The sandbox user sees only public key material and a socket symlink. Private keys, the agent's keyring, and the actual socket file live in a root-only directory that Landlock denies access to (it is not in any allow list).
+
+### Startup Lifecycle
+
+The following sequence diagram shows the full GPG agent startup flow within `run_sandbox()`:
+
+```mermaid
+sequenceDiagram
+    participant GW as Gateway
+    participant SB as Sandbox Supervisor
+    participant GA as gpg-agent (root)
+    participant Child as Sandbox Process
+
+    Note over GW: extract_policy_secrets() maps URNs
+    GW->>GW: file_secrets["/var/lib/.../private-key.asc"] = private_key_urn
+    GW->>GW: secrets["__OPENSHELL_GPG_PASSPHRASE"] = passphrase_urn
+
+    Note over SB: run_sandbox() startup
+    SB->>SB: write_file_secrets() writes private key to disk
+    SB->>SB: start_gpg_agent_from_config()
+    SB->>SB: Create /run/openshell-gpg/private/ (root 0700)
+    SB->>SB: Create /sandbox/.gnupg/ (sandbox 0700)
+    SB->>SB: Write gpg-agent.conf (infinite cache, preset allowed)
+    SB->>GA: gpg-agent --daemon --homedir /run/openshell-gpg/private/
+    SB->>GA: gpg --import private-key.asc
+    SB->>SB: get_keygrip() via gpg --with-keygrip --list-secret-keys
+    SB->>GA: gpg-preset-passphrase --preset <keygrip> (passphrase on stdin)
+    SB->>SB: Export public keyring to /sandbox/.gnupg/pubring.kbx
+    SB->>SB: Write gpg.conf (no-autostart)
+    SB->>SB: Symlink S.gpg-agent into /sandbox/.gnupg/
+    SB->>SB: Write .gitconfig (if signing_key_id set)
+    SB->>SB: Inject GNUPGHOME=/sandbox/.gnupg into provider_env
+    SB->>SB: Add /sandbox/.gnupg to Landlock read_write
+    SB->>SB: Remove __OPENSHELL_GPG_PASSPHRASE from provider_env
+    SB->>SB: Register agent PID as managed child
+    Note over SB: Continue with proxy, namespace, child spawn...
+    SB->>Child: exec (GNUPGHOME=/sandbox/.gnupg)
+    Child->>GA: gpg --sign (via Unix socket symlink)
+    GA-->>Child: Signature (private key never leaves agent)
+```
+
+**Step-by-step in `start_gpg_agent_from_config()`** (`crates/openshell-sandbox/src/lib.rs`):
+
+1. Extract the private key bytes from `file_secrets` at `/var/lib/openshell/gpg/private-key.asc` (written earlier by `write_file_secrets()`).
+2. Extract the passphrase from `provider_env` under `__OPENSHELL_GPG_PASSPHRASE`.
+3. Resolve the `sandbox` user's UID/GID via `nix::unistd::User::from_name()`.
+4. Call `gpg_agent::start_gpg_agent()` which performs the directory setup and daemon lifecycle (see below).
+5. Inject `GNUPGHOME=/sandbox/.gnupg` into `provider_env` via `child_env::gpg_agent_env_vars()`.
+6. Add `/sandbox/.gnupg` to `policy.filesystem.read_write` for Landlock.
+7. Remove `__OPENSHELL_GPG_PASSPHRASE` from `provider_env` so the sandbox user never sees it.
+8. Register the agent PID via `register_managed_child()` so the SIGCHLD reaper does not prematurely collect it.
+
+**Inside `start_gpg_agent()`** (`crates/openshell-sandbox/src/gpg_agent.rs`):
+
+1. Verify `gpg`, `gpg-agent`, and `gpg-preset-passphrase` binaries are in PATH.
+2. Create `/run/openshell-gpg/private/` with mode 0700 (root-only).
+3. Create `/sandbox/.gnupg/` with mode 0700, `chown` to sandbox user.
+4. Write `gpg-agent.conf` with `allow-preset-passphrase` and infinite cache TTLs.
+5. Write private key to the private directory.
+6. Start `gpg-agent --daemon --homedir /run/openshell-gpg/private/`.
+7. Import the private key via `gpg --batch --import`.
+8. Extract the keygrip via `gpg --with-keygrip --list-secret-keys`.
+9. Pre-seed the passphrase via `gpg-preset-passphrase --preset <keygrip>` (passphrase piped on stdin).
+10. Export the public keyring to `/sandbox/.gnupg/pubring.kbx`, `chown` to sandbox user.
+11. Write `gpg.conf` with `no-autostart` to `/sandbox/.gnupg/`, `chown` to sandbox user.
+12. Create a symlink from `/sandbox/.gnupg/S.gpg-agent` to `/run/openshell-gpg/private/S.gpg-agent`.
+13. If `signing_key_id` is set, write `/sandbox/.gitconfig` with `[user] signingkey` and `[commit] gpgsign = true`, `chown` to sandbox user.
+14. Read the agent PID via `gpg-connect-agent GETINFO pid /bye`.
+15. Return a `GpgAgentHandle` containing the PID and both directory paths.
+
+### Cleanup
+
+`GpgAgentHandle` implements `Drop`. When the sandbox supervisor exits (or the handle goes out of scope), the destructor calls `gpgconf --homedir /run/openshell-gpg/private/ --kill gpg-agent` to shut down the daemon. The `_gpg_agent_handle` variable in `run_sandbox()` keeps the handle alive for the duration of the sandbox session.
+
+### Security Model
+
+| Threat | Mitigation |
+|--------|-----------|
+| Sandbox user reads private key | Private key lives in `/run/openshell-gpg/private/` (root 0700). Not in any Landlock allow list, so Landlock denies access even if the user discovers the path. |
+| Sandbox user reads passphrase from env | `__OPENSHELL_GPG_PASSPHRASE` is removed from `provider_env` before the child process starts. |
+| Sandbox user attaches to gpg-agent via ptrace | Seccomp blocks `ptrace` and `process_vm_readv` syscalls. |
+| Sandbox user impersonates signing via raw socket | `gpg-agent` authenticates via the Unix socket protocol. The sandbox user can only request operations the agent permits (sign, encrypt). The agent holds the key but never exports it. |
+| Sandbox user starts own gpg-agent | `gpg.conf` includes `no-autostart`, and `GNUPGHOME` points to the sandbox-accessible directory which does not contain a private key. |
+| Competing GNUPGHOME from secret_mounts | Policy validation rejects `gpg_agent` when any `secret_mounts` entry targets a `.gnupg` path. |
+
+### Static Field Enforcement
+
+`gpg_agent` is a static field — it cannot be changed on a live sandbox via `UpdateSandboxPolicy`. The server validates this in `validate_static_fields_unchanged()` (`crates/openshell-server/src/grpc.rs`). The `gpg_agent` block is also included in the deterministic policy hash via `deterministic_policy_hash()` (proto-encoded bytes).
+
+### OPA Exclusion
+
+The `gpg_agent` block is excluded from OPA evaluation data (`proto_to_opa_data_json()` in `crates/openshell-sandbox/src/opa.rs`). OPA rules never see URNs or signing key IDs. This prevents policy Rego code from accidentally leaking secret references in decision logs or error messages.
+
+### Proto and Data Model
+
+| Layer | Location | Field |
+|-------|----------|-------|
+| Policy YAML | `crates/openshell-policy/src/lib.rs` -- `PolicyFile` | `gpg_agent: Option<GpgAgentDef>` |
+| Policy proto | `proto/sandbox.proto` -- `SandboxPolicy` | `GpgAgentConfig gpg_agent = 8` |
+| Proto message | `proto/sandbox.proto` -- `GpgAgentConfig` | `private_key_urn` (string), `passphrase_urn` (string), `signing_key_id` (string) |
+| Gateway extraction | `crates/openshell-server/src/grpc.rs` -- `extract_policy_secrets()` | Maps URNs to `file_secrets` and `secrets` entries |
+| Static validation | `crates/openshell-server/src/grpc.rs` -- `validate_static_fields_unchanged()` | Rejects changes to `gpg_agent` on live sandbox |
+| Policy hash | `crates/openshell-server/src/grpc.rs` -- `deterministic_policy_hash()` | Includes `gpg_agent` proto-encoded bytes |
+| Sandbox lifecycle | `crates/openshell-sandbox/src/gpg_agent.rs` -- `start_gpg_agent()` | Returns `GpgAgentHandle` |
+| Env injection | `crates/openshell-sandbox/src/child_env.rs` -- `gpg_agent_env_vars()` | Sets `GNUPGHOME` |
+
+---
+
 ## Environment Variables Reference
 
 ### Configuration (CLI flags / env vars)
@@ -1517,7 +1689,7 @@ Companion env vars use `entry().or_insert()` so they do not override values alre
 | `CURL_CA_BUNDLE` | Combined CA bundle path (curl/libcurl) |
 | Provider credentials | From `GetSandboxProviderEnvironment` RPC (e.g., `ANTHROPIC_API_KEY`) |
 | `GIT_SSH_COMMAND` | SSH command pointing to mounted key (set when file secret path contains `.ssh`) |
-| `GNUPGHOME` | GPG home directory (set when file secret path contains `.gnupg`) |
+| `GNUPGHOME` | GPG home directory (set via `gpg_agent` block pointing to `/sandbox/.gnupg`, or via file secret mount path containing `.gnupg`) |
 
 ### Injected into SSH child process (additional)
 
@@ -1535,6 +1707,7 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 |-----------|----------|
 | Policy fetch failure (gRPC or file) | Fatal -- sandbox cannot start without policy |
 | Provider env fetch failure | Warn + continue with empty map |
+| GPG agent startup failure | Warn + continue without signing support (non-fatal) |
 | Policy poll: gateway unreachable | Debug log + retry on next interval |
 | Policy poll: `reload_from_proto()` failure | Warn + keep last-known-good engine + report FAILED status to gateway |
 | Policy poll: status report failure | Warn + poll loop continues |
