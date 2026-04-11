@@ -2838,9 +2838,12 @@ process:
         let mut proto = test_proto();
         proto.secrets = Some(PolicySecrets {
             provider: "keyvengers".to_string(),
-            env: [("ANTHROPIC_API_KEY".to_string(), "urn:secret:claude-api".to_string())]
-                .into_iter()
-                .collect(),
+            env: [(
+                "ANTHROPIC_API_KEY".to_string(),
+                "urn:secret:claude-api".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         });
         proto.secret_mounts = vec![SecretMount {
             source_urn: "urn:secret-b64:ssh-key".to_string(),

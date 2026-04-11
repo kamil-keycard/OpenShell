@@ -701,9 +701,7 @@ pub fn validate_sandbox_policy(
         for (key, value) in &secrets.env {
             if !is_valid_env_key(key) {
                 violations.push(PolicyViolation::InvalidSecrets {
-                    reason: format!(
-                        "env key '{key}' is not a valid environment variable name"
-                    ),
+                    reason: format!("env key '{key}' is not a valid environment variable name"),
                 });
             }
             if value.is_empty() {
@@ -1503,7 +1501,10 @@ secrets:
 
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
-        let secrets2 = proto2.secrets.as_ref().expect("secrets should survive round-trip");
+        let secrets2 = proto2
+            .secrets
+            .as_ref()
+            .expect("secrets should survive round-trip");
         assert_eq!(secrets2.provider, secrets.provider);
         assert_eq!(secrets2.env.len(), secrets.env.len());
         assert_eq!(secrets2.env["ANTHROPIC_API_KEY"], "urn:secret:claude-api");
@@ -1526,10 +1527,11 @@ secrets:
                 .collect(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations.iter().any(|v| matches!(
-            v,
-            PolicyViolation::InvalidSecrets { .. }
-        )));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidSecrets { .. }))
+        );
     }
 
     #[test]
@@ -1553,9 +1555,7 @@ secrets:
         let mut policy = restrictive_default_policy();
         policy.secrets = Some(PolicySecrets {
             provider: "keyvengers".into(),
-            env: [("MY_KEY".into(), String::new())]
-                .into_iter()
-                .collect(),
+            env: [("MY_KEY".into(), String::new())].into_iter().collect(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| match v {

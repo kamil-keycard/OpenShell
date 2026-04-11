@@ -3564,11 +3564,12 @@ fn extract_policy_secrets(spec: &mut openshell_core::proto::SandboxSpec) {
     // secrets.env → spec.secrets (CLI takes precedence)
     if let Some(ref policy_secrets) = policy.secrets {
         for (key, urn) in &policy_secrets.env {
-            spec.secrets.entry(key.clone()).or_insert_with(|| urn.clone());
+            spec.secrets
+                .entry(key.clone())
+                .or_insert_with(|| urn.clone());
         }
         // secrets.provider → spec.providers (if not already present)
-        if !policy_secrets.provider.is_empty()
-            && !spec.providers.contains(&policy_secrets.provider)
+        if !policy_secrets.provider.is_empty() && !spec.providers.contains(&policy_secrets.provider)
         {
             spec.providers.push(policy_secrets.provider.clone());
         }

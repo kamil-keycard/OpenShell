@@ -125,8 +125,13 @@
 - Validation: absolute paths, no traversal, non-empty URNs, max 4096 char paths (in validate_sandbox_policy)
 
 ## Policy System Details
-- YAML data file top-level keys: filesystem_policy, landlock, process, network_policies, secret_mounts
-- Proto SandboxPolicy fields: version, filesystem, landlock, process, network_policies, secret_mounts (NO inference field)
+- YAML data file top-level keys: secrets, secret_mounts, filesystem_policy, landlock, process, network_policies
+- Proto SandboxPolicy fields: version, filesystem, landlock, process, network_policies, secret_mounts, secrets (NO inference field)
+- PolicySecrets proto message: provider (string), env (map<string,string>) -- field 7 on SandboxPolicy
+- secrets and secret_mounts excluded from OPA data (proto_to_opa_data_json skips them)
+- secrets and secret_mounts are static fields -- validated by validate_static_fields_unchanged()
+- extract_policy_secrets() in grpc.rs merges secrets.env → SandboxSpec.secrets, secrets.provider → SandboxSpec.providers
+- Deterministic hashing includes secrets (provider hashed directly, env sorted by key)
 - Proto message field `filesystem` maps to YAML key `filesystem_policy` (different names!)
 - IMPORTANT: Sandbox always runs in Proxy mode. NetworkMode::Block exists as enum variant but is NEVER set.
 - Both file mode and gRPC mode set NetworkMode::Proxy unconditionally (see load_policy() in lib.rs and TryFrom in policy.rs)
