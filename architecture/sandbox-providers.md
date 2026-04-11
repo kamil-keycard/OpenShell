@@ -557,14 +557,7 @@ The sandbox never sees the per-sandbox OAuth credentials or the Keycard admin cr
 It receives only the actual API keys (e.g., `ANTHROPIC_API_KEY=sk-ant-...`) through the
 standard placeholder/proxy resolution mechanism.
 
-CLI usage:
-
-```bash
-openshell sandbox create --provider my-keycard \
-  --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key
-```
-
-Alternatively, the same configuration can be declared in the policy YAML:
+Secrets are declared in the policy YAML:
 
 ```yaml
 secrets:
@@ -578,8 +571,7 @@ openshell sandbox create --policy policy.yaml
 ```
 
 The gateway extracts `secrets.provider` and `secrets.env` from the policy during sandbox
-creation, so the `--provider` and `--secret` CLI flags are not required when the policy
-declares them. See [Policy-Declared Secrets](#policy-declared-secrets) for merge semantics.
+creation. See [Policy-Declared Secrets](#policy-declared-secrets) for extraction semantics.
 
 ### Ephemeral Credential Store
 
@@ -607,40 +599,27 @@ would need reprovisioning.
 
 ### End-to-End Flow
 
-Secrets can arrive via CLI flags, policy declarations, or both. The gateway merges them
-(CLI takes precedence) before proceeding with Keycard provisioning.
-
-**Path A — CLI flags only:**
-
-```
-CLI: openshell sandbox create --provider my-keycard \
-       --secret ANTHROPIC_API_KEY=urn:resource:anthropic-api-key -- claude
-  |
-  +-- SandboxSpec.providers = ["my-keycard"]
-  +-- SandboxSpec.secrets = {ANTHROPIC_API_KEY: "urn:resource:anthropic-api-key"}
-  +-- Sends CreateSandboxRequest to gateway
-```
-
-**Path B — Policy-declared secrets (no CLI flags):**
+Secrets are declared in the policy YAML. The gateway extracts them into the
+`SandboxSpec` before proceeding with Keycard provisioning.
 
 ```
 CLI: openshell sandbox create --policy policy.yaml -- claude
   |
   +-- SandboxSpec.policy.secrets = {provider: "my-keycard", env: {ANTHROPIC_API_KEY: ...}}
-  +-- SandboxSpec.providers = [] (empty — no --provider flag)
-  +-- SandboxSpec.secrets = {} (empty — no --secret flags)
+  +-- SandboxSpec.providers = [] (populated server-side from policy)
+  +-- SandboxSpec.secrets = {} (populated server-side from policy)
   +-- Sends CreateSandboxRequest to gateway
 ```
 
-**Gateway processing (both paths converge):**
+**Gateway processing:**
 
 ```
 Gateway: create_sandbox()
   +-- Validates policy, ensures process identity defaults
   +-- extract_policy_secrets():
-  |     +-- Merges policy.secrets.env into spec.secrets (CLI values already present win)
-  |     +-- Merges policy.secrets.provider into spec.providers (if not already listed)
-  |     +-- Merges policy.secret_mounts into spec.file_secrets (CLI values win by target_path)
+  |     +-- Extracts policy.secrets.env into spec.secrets
+  |     +-- Extracts policy.secrets.provider into spec.providers (if not already listed)
+  |     +-- Extracts policy.secret_mounts into spec.file_secrets
   +-- Validates provider "my-keycard" exists, detects type "keycard"
   +-- Validates secrets requires keycard provider (fail if none)
   +-- Generates sandbox ID
