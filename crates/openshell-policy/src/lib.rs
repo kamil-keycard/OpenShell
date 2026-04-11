@@ -586,6 +586,8 @@ pub enum PolicyViolation {
     InvalidSecretMount { reason: String },
     /// A secrets block field is invalid.
     InvalidSecrets { reason: String },
+    /// A gpg_agent block field is invalid.
+    InvalidGpgAgent { reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -620,6 +622,9 @@ impl fmt::Display for PolicyViolation {
             }
             Self::InvalidSecrets { reason } => {
                 write!(f, "invalid secrets: {reason}")
+            }
+            Self::InvalidGpgAgent { reason } => {
+                write!(f, "invalid gpg_agent: {reason}")
             }
         }
     }
@@ -779,6 +784,39 @@ pub fn validate_sandbox_policy(
             violations.push(PolicyViolation::InvalidSecretMount {
                 reason: format!("source_urn is empty for mount at '{}'", mount.target_path),
             });
+        }
+    }
+
+    if let Some(ref gpg) = policy.gpg_agent {
+        if gpg.private_key_urn.is_empty() {
+            violations.push(PolicyViolation::InvalidGpgAgent {
+                reason: "private_key_urn is required".to_string(),
+            });
+        } else if !gpg.private_key_urn.starts_with("urn:secret-b64:") {
+            violations.push(PolicyViolation::InvalidGpgAgent {
+                reason: "private_key_urn must use the urn:secret-b64: scheme".to_string(),
+            });
+        }
+        if gpg.passphrase_urn.is_empty() {
+            violations.push(PolicyViolation::InvalidGpgAgent {
+                reason: "passphrase_urn is required".to_string(),
+            });
+        } else if !gpg.passphrase_urn.starts_with("urn:secret:") {
+            violations.push(PolicyViolation::InvalidGpgAgent {
+                reason: "passphrase_urn must use the urn:secret: scheme".to_string(),
+            });
+        }
+
+        for mount in &policy.secret_mounts {
+            if mount.target_path.contains(".gnupg") {
+                violations.push(PolicyViolation::InvalidGpgAgent {
+                    reason: format!(
+                        "gpg_agent conflicts with secret_mount targeting '{}' \
+                         (competing GNUPGHOME ownership)",
+                        mount.target_path
+                    ),
+                });
+            }
         }
     }
 
@@ -1633,6 +1671,108 @@ secret_mounts:
     }
 
     // ---- GPG agent tests ----
+
+    #[test]
+    fn validate_rejects_gpg_agent_without_private_key_urn() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: String::new(),
+            passphrase_urn: "urn:secret:gpg-passphrase".into(),
+            signing_key_id: String::new(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidGpgAgent { reason } => reason.contains("private_key_urn"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_gpg_agent_wrong_private_key_scheme() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: "urn:secret:wrong-scheme".into(),
+            passphrase_urn: "urn:secret:gpg-passphrase".into(),
+            signing_key_id: String::new(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidGpgAgent { reason } => reason.contains("urn:secret-b64:"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_gpg_agent_without_passphrase_urn() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: "urn:secret-b64:gpg-private-key".into(),
+            passphrase_urn: String::new(),
+            signing_key_id: String::new(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidGpgAgent { reason } => reason.contains("passphrase_urn"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_gpg_agent_wrong_passphrase_scheme() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: "urn:secret-b64:gpg-private-key".into(),
+            passphrase_urn: "urn:secret-b64:wrong-scheme".into(),
+            signing_key_id: String::new(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidGpgAgent { reason } => reason.contains("urn:secret:"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_gpg_agent_with_gnupg_secret_mount() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: "urn:secret-b64:gpg-private-key".into(),
+            passphrase_urn: "urn:secret:gpg-passphrase".into(),
+            signing_key_id: String::new(),
+        });
+        policy.secret_mounts.push(ProtoSecretMount {
+            source_urn: "urn:secret-b64:gpg-keyring".into(),
+            target_path: "/sandbox/.gnupg/pubring.kbx".into(),
+            mode: String::new(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidGpgAgent { reason } => reason.contains("conflicts"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_accepts_valid_gpg_agent() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: "urn:secret-b64:gpg-private-key".into(),
+            passphrase_urn: "urn:secret:gpg-passphrase".into(),
+            signing_key_id: "ABCDEF1234567890".into(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_gpg_agent_without_signing_key_id() {
+        let mut policy = restrictive_default_policy();
+        policy.gpg_agent = Some(ProtoGpgAgentConfig {
+            private_key_urn: "urn:secret-b64:gpg-private-key".into(),
+            passphrase_urn: "urn:secret:gpg-passphrase".into(),
+            signing_key_id: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
 
     #[test]
     fn round_trip_preserves_gpg_agent() {
