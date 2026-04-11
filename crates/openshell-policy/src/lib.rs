@@ -558,6 +558,8 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A secret mount path is invalid.
     InvalidSecretMount { reason: String },
+    /// A secrets block field is invalid.
+    InvalidSecrets { reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -590,8 +592,22 @@ impl fmt::Display for PolicyViolation {
             Self::InvalidSecretMount { reason } => {
                 write!(f, "invalid secret mount: {reason}")
             }
+            Self::InvalidSecrets { reason } => {
+                write!(f, "invalid secrets: {reason}")
+            }
         }
     }
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 /// Validate that a sandbox policy does not contain unsafe content.
@@ -671,6 +687,28 @@ pub fn validate_sandbox_policy(
                 // Path is "/" or "///" etc.
                 violations.push(PolicyViolation::OverlyBroadPath {
                     path: path_str.clone(),
+                });
+            }
+        }
+    }
+
+    if let Some(ref secrets) = policy.secrets {
+        if !secrets.env.is_empty() && secrets.provider.is_empty() {
+            violations.push(PolicyViolation::InvalidSecrets {
+                reason: "env secrets declared but provider is empty".to_string(),
+            });
+        }
+        for (key, value) in &secrets.env {
+            if !is_valid_env_key(key) {
+                violations.push(PolicyViolation::InvalidSecrets {
+                    reason: format!(
+                        "env key '{key}' is not a valid environment variable name"
+                    ),
+                });
+            }
+            if value.is_empty() {
+                violations.push(PolicyViolation::InvalidSecrets {
+                    reason: format!("env value is empty for key '{key}'"),
                 });
             }
         }
@@ -1442,5 +1480,128 @@ network_policies:
             mode: "0600".to_string(),
         });
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    // ---- Secrets validation tests ----
+
+    #[test]
+    fn round_trip_preserves_secrets() {
+        let yaml = r#"
+version: 1
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+    GITHUB_TOKEN: "urn:secret:gh-token"
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let secrets = proto1.secrets.as_ref().expect("secrets should be present");
+        assert_eq!(secrets.provider, "keyvengers");
+        assert_eq!(secrets.env.len(), 2);
+        assert_eq!(secrets.env["ANTHROPIC_API_KEY"], "urn:secret:claude-api");
+        assert_eq!(secrets.env["GITHUB_TOKEN"], "urn:secret:gh-token");
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        let secrets2 = proto2.secrets.as_ref().expect("secrets should survive round-trip");
+        assert_eq!(secrets2.provider, secrets.provider);
+        assert_eq!(secrets2.env.len(), secrets.env.len());
+        assert_eq!(secrets2.env["ANTHROPIC_API_KEY"], "urn:secret:claude-api");
+    }
+
+    #[test]
+    fn secrets_absent_parses_fine() {
+        let yaml = "version: 1\n";
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        assert!(proto.secrets.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_secrets_env_without_provider() {
+        let mut policy = restrictive_default_policy();
+        policy.secrets = Some(PolicySecrets {
+            provider: String::new(),
+            env: [("ANTHROPIC_API_KEY".into(), "urn:secret:claude-api".into())]
+                .into_iter()
+                .collect(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidSecrets { .. }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_env_key() {
+        let mut policy = restrictive_default_policy();
+        policy.secrets = Some(PolicySecrets {
+            provider: "keyvengers".into(),
+            env: [("123-BAD-KEY".into(), "urn:secret:test".into())]
+                .into_iter()
+                .collect(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidSecrets { reason } => reason.contains("123-BAD-KEY"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_empty_env_value() {
+        let mut policy = restrictive_default_policy();
+        policy.secrets = Some(PolicySecrets {
+            provider: "keyvengers".into(),
+            env: [("MY_KEY".into(), String::new())]
+                .into_iter()
+                .collect(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| match v {
+            PolicyViolation::InvalidSecrets { reason } => reason.contains("MY_KEY"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn validate_accepts_valid_secrets() {
+        let mut policy = restrictive_default_policy();
+        policy.secrets = Some(PolicySecrets {
+            provider: "keyvengers".into(),
+            env: [("ANTHROPIC_API_KEY".into(), "urn:secret:claude-api".into())]
+                .into_iter()
+                .collect(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_provider_only_secrets() {
+        let mut policy = restrictive_default_policy();
+        policy.secrets = Some(PolicySecrets {
+            provider: "keyvengers".into(),
+            env: HashMap::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn secrets_and_secret_mounts_combined() {
+        let yaml = r#"
+version: 1
+secrets:
+  provider: keyvengers
+  env:
+    ANTHROPIC_API_KEY: "urn:secret:claude-api"
+secret_mounts:
+  - source_urn: "urn:secret-b64:ssh-key"
+    target_path: "/sandbox/.ssh/id_ed25519"
+    mode: "0600"
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        assert!(proto.secrets.is_some());
+        assert_eq!(proto.secret_mounts.len(), 1);
+        assert!(validate_sandbox_policy(&proto).is_ok());
     }
 }
