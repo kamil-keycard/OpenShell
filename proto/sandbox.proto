@@ -19,6 +19,8 @@ message SandboxPolicy {
   map<string, NetworkPolicyRule> network_policies = 5;
   // Declarative file secret mounts for policy auditing.
   repeated SecretMount secret_mounts = 6;
+  // Secret bindings: Keycard provider and env var secrets.
+  PolicySecrets secrets = 7;
 }
 
 // Filesystem access policy.
@@ -199,4 +201,12 @@ message SecretMount {
   string target_path = 2;
   // Unix file mode (e.g. "0600"). Defaults to "0600" if empty.
   string mode = 3;
+}
+
+// Env var secret bindings and the Keycard provider used to resolve them.
+message PolicySecrets {
+  // Name of the Keycard provider for credential resolution.
+  string provider = 1;
+  // Env var name → Keycard resource URN.
+  map<string, string> env = 2;
 }

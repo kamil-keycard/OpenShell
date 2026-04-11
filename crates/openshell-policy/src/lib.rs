@@ -16,7 +16,7 @@ use std::path::Path;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, L7Allow, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    NetworkEndpoint, NetworkPolicyRule, PolicySecrets, ProcessPolicy, SandboxPolicy,
     SecretMount as ProtoSecretMount,
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,10 @@ use serde::{Deserialize, Serialize};
 struct PolicyFile {
     version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    secrets: Option<SecretsDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secret_mounts: Vec<SecretMountDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     filesystem_policy: Option<FilesystemDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     landlock: Option<LandlockDef>,
@@ -37,8 +41,15 @@ struct PolicyFile {
     process: Option<ProcessDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    secret_mounts: Vec<SecretMountDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretsDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    provider: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -242,6 +253,11 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
         })
         .collect();
 
+    let secrets = raw.secrets.map(|s| PolicySecrets {
+        provider: s.provider,
+        env: s.env.into_iter().collect(),
+    });
+
     SandboxPolicy {
         version: raw.version,
         filesystem: raw.filesystem_policy.map(|fs| FilesystemPolicy {
@@ -266,6 +282,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                 mode: sm.mode,
             })
             .collect(),
+        secrets,
     }
 }
 
@@ -377,13 +394,25 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         })
         .collect();
 
+    let secrets = policy.secrets.as_ref().and_then(|s| {
+        if s.provider.is_empty() && s.env.is_empty() {
+            None
+        } else {
+            Some(SecretsDef {
+                provider: s.provider.clone(),
+                env: s.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            })
+        }
+    });
+
     PolicyFile {
         version: policy.version,
+        secrets,
+        secret_mounts,
         filesystem_policy,
         landlock,
         process,
         network_policies,
-        secret_mounts,
     }
 }
 
@@ -481,6 +510,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         }),
         network_policies: HashMap::new(),
         secret_mounts: Vec::new(),
+        secrets: None,
     }
 }
 
@@ -1092,6 +1122,7 @@ network_policies:
             landlock: None,
             network_policies: HashMap::new(),
             secret_mounts: Vec::new(),
+            secrets: None,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
