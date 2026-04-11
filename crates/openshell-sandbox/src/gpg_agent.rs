@@ -3,17 +3,21 @@
 
 //! GPG agent lifecycle management for sandbox commit signing.
 //!
-//! Spawns a `gpg-agent` daemon with a split directory layout:
+//! Spawns a `gpg-agent` daemon whose homedir is `/sandbox/.gnupg/`.
+//! The sandbox user connects to the **main** agent socket (not the
+//! extra/restricted socket) so that the pre-seeded passphrase cache
+//! is available for signing — GnuPG's extra socket deliberately
+//! disables passphrase cache lookups, which breaks non-interactive
+//! signing.
 //!
-//! - `/run/openshell-gpg/private/` — root-only (0700), holds the private key
-//!   and the agent's keyring. The sandbox user cannot access this directory.
+//! Private key material lives on disk (passphrase-protected) in
+//! `/sandbox/.gnupg/private-keys-v1.d/`, readable only by root.
+//! After setup the directory is chowned to the sandbox user, but the
+//! `private-keys-v1.d/` subtree stays root-only so the sandbox user
+//! cannot read the raw (encrypted) key files.
 //!
-//! - `/sandbox/.gnupg/` — sandbox-accessible, holds only the public keyring,
-//!   a `gpg.conf` with `no-autostart`, and the agent's extra socket.
-//!   The extra socket is a real file (not a symlink) so Landlock allows access.
-//!
-//! The sandbox user gets signing capability via `gpg --sign` or `git commit -S`
-//! without ever seeing private key material.
+//! The sandbox user gets signing capability via `gpg --sign` or
+//! `git commit -S` using the cached passphrase in the agent.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,23 +25,22 @@ use std::process::Command;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tracing::{debug, info, warn};
 
-const PRIVATE_DIR: &str = "/run/openshell-gpg/private";
 const SANDBOX_GNUPG_DIR: &str = "/sandbox/.gnupg";
 const SOCKET_NAME: &str = "S.gpg-agent";
+const PINENTRY_DIR: &str = "/run/openshell-gpg";
 
 /// Handle to a running `gpg-agent` daemon.
 ///
 /// The agent is killed when the handle is dropped.
 pub(crate) struct GpgAgentHandle {
     pid: u32,
-    private_dir: PathBuf,
-    sandbox_gnupg_dir: PathBuf,
+    gnupg_dir: PathBuf,
 }
 
 impl GpgAgentHandle {
     /// Return the sandbox-accessible GNUPGHOME directory.
     pub fn gnupg_dir(&self) -> &Path {
-        &self.sandbox_gnupg_dir
+        &self.gnupg_dir
     }
 
     /// Return the PID of the gpg-agent process (used on Linux for SIGCHLD reaper).
@@ -51,7 +54,7 @@ impl Drop for GpgAgentHandle {
     fn drop(&mut self) {
         debug!(pid = self.pid, "Shutting down gpg-agent");
         let _ = Command::new("gpgconf")
-            .args(["--homedir", &self.private_dir.display().to_string()])
+            .args(["--homedir", &self.gnupg_dir.display().to_string()])
             .args(["--kill", "gpg-agent"])
             .output();
     }
@@ -62,17 +65,14 @@ impl Drop for GpgAgentHandle {
 /// # Directory layout
 ///
 /// ```text
-/// /run/openshell-gpg/private/   (root:root 0700)
-///   ├── private-key.asc         (imported into keyring)
+/// /sandbox/.gnupg/                   (sandbox:sandbox 0700)
 ///   ├── gpg-agent.conf
+///   ├── gpg.conf                     (no-autostart)
 ///   ├── pubring.kbx
-///   ├── private-keys-v1.d/
-///   └── S.gpg-agent
-///
-/// /sandbox/.gnupg/              (sandbox:sandbox 0700)
-///   ├── pubring.kbx             (copy of public keyring)
-///   ├── gpg.conf                (no-autostart)
-///   └── S.gpg-agent             (extra socket, chowned to sandbox)
+///   ├── trustdb.gpg
+///   ├── S.gpg-agent                  (main socket — unrestricted)
+///   └── private-keys-v1.d/           (root:root 0700 — sandbox can't read)
+///       └── <keygrip>.key
 /// ```
 #[cfg(unix)]
 pub(crate) fn start_gpg_agent(
@@ -82,48 +82,40 @@ pub(crate) fn start_gpg_agent(
     sandbox_uid: nix::unistd::Uid,
     sandbox_gid: nix::unistd::Gid,
 ) -> Result<GpgAgentHandle> {
-    use nix::unistd::chown;
     use std::os::unix::fs::PermissionsExt;
 
-    let private_dir = Path::new(PRIVATE_DIR);
-    let sandbox_gnupg_dir = Path::new(SANDBOX_GNUPG_DIR);
+    let gnupg_dir = Path::new(SANDBOX_GNUPG_DIR);
 
     let preset_bin = check_gpg_binaries()?;
 
-    // Create private directory (root-only).
-    std::fs::create_dir_all(private_dir)
+    // Create the gnupg directory as root (chowned to sandbox user later,
+    // after private key material has been locked down).
+    std::fs::create_dir_all(gnupg_dir)
         .into_diagnostic()
-        .wrap_err("failed to create gpg private directory")?;
-    std::fs::set_permissions(private_dir, std::fs::Permissions::from_mode(0o700))
+        .wrap_err("failed to create .gnupg directory")?;
+    std::fs::set_permissions(gnupg_dir, std::fs::Permissions::from_mode(0o700))
         .into_diagnostic()?;
 
-    // Create sandbox-accessible gnupg directory.
-    std::fs::create_dir_all(sandbox_gnupg_dir)
-        .into_diagnostic()
-        .wrap_err("failed to create sandbox .gnupg directory")?;
-    chown(sandbox_gnupg_dir, Some(sandbox_uid), Some(sandbox_gid))
-        .into_diagnostic()
-        .wrap_err("failed to chown sandbox .gnupg directory")?;
-    std::fs::set_permissions(sandbox_gnupg_dir, std::fs::Permissions::from_mode(0o700))
-        .into_diagnostic()?;
+    // Install a headless pinentry that reads the passphrase from a
+    // root-only file. The agent runs as root, so pinentry (launched
+    // by the agent) can read the file. This guarantees signing works
+    // even if the passphrase cache is invalidated.
+    let pinentry_path = install_pinentry(passphrase)?;
 
-    // Write gpg-agent.conf to private dir.
-    // extra-socket creates a real socket in the sandbox dir (not a symlink),
-    // so Landlock + DAC both allow the sandbox user to connect.
-    let extra_socket_path = sandbox_gnupg_dir.join(SOCKET_NAME);
     let agent_conf = format!(
         "default-cache-ttl 31536000\n\
          max-cache-ttl 31536000\n\
          allow-preset-passphrase\n\
-         extra-socket {}\n",
-        extra_socket_path.display()
+         allow-loopback-pinentry\n\
+         pinentry-program {}\n",
+        pinentry_path.display()
     );
-    std::fs::write(private_dir.join("gpg-agent.conf"), &agent_conf)
+    std::fs::write(gnupg_dir.join("gpg-agent.conf"), &agent_conf)
         .into_diagnostic()
         .wrap_err("failed to write gpg-agent.conf")?;
 
-    // Write the private key to the private directory.
-    let key_path = private_dir.join("private-key.asc");
+    // Write the private key to a temporary file for import.
+    let key_path = gnupg_dir.join("private-key.asc");
     std::fs::write(&key_path, private_key)
         .into_diagnostic()
         .wrap_err("failed to write gpg private key")?;
@@ -131,20 +123,27 @@ pub(crate) fn start_gpg_agent(
         .into_diagnostic()?;
 
     // Start gpg-agent daemon.
-    let output = Command::new("gpg-agent")
+    //
+    // gpg-agent --daemon forks: the parent exits quickly while the child
+    // continues as the long-running daemon. We must NOT use .output() here
+    // because the daemon child inherits our pipe FDs, keeping the write ends
+    // open indefinitely — .output() waits for EOF and blocks forever.
+    let status = Command::new("gpg-agent")
         .args([
             "--homedir",
-            &private_dir.display().to_string(),
+            &gnupg_dir.display().to_string(),
             "--daemon",
             "--verbose",
         ])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
         .into_diagnostic()
         .wrap_err("failed to start gpg-agent")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!("gpg-agent failed to start: {stderr}"));
+    if !status.success() {
+        return Err(miette::miette!("gpg-agent failed to start: {status}"));
     }
     info!("gpg-agent daemon started");
 
@@ -152,7 +151,7 @@ pub(crate) fn start_gpg_agent(
     let import_output = Command::new("gpg")
         .args([
             "--homedir",
-            &private_dir.display().to_string(),
+            &gnupg_dir.display().to_string(),
             "--batch",
             "--import",
         ])
@@ -167,52 +166,56 @@ pub(crate) fn start_gpg_agent(
     }
     info!("GPG private key imported");
 
+    // Remove the raw key file — it's now in the keyring.
+    let _ = std::fs::remove_file(&key_path);
+
     // Pre-seed the passphrase for every keygrip (primary + subkeys).
-    let keygrips = get_all_keygrips(private_dir)?;
+    let keygrips = get_all_keygrips(gnupg_dir)?;
     for grip in &keygrips {
-        preset_passphrase(&preset_bin, private_dir, grip, passphrase)?;
+        preset_passphrase(&preset_bin, gnupg_dir, grip, passphrase)?;
     }
     info!(
         count = keygrips.len(),
         "GPG passphrase pre-seeded for all keygrips"
     );
 
-    // Export the public key and import into the sandbox-accessible keyring.
-    export_public_key(private_dir, sandbox_gnupg_dir)?;
-
     // Write gpg.conf for the sandbox user's gpg client.
     let gpg_conf = "no-autostart\n";
-    std::fs::write(sandbox_gnupg_dir.join("gpg.conf"), gpg_conf)
+    std::fs::write(gnupg_dir.join("gpg.conf"), gpg_conf)
         .into_diagnostic()
         .wrap_err("failed to write gpg.conf")?;
 
-    // Wait for the extra socket to appear (created by gpg-agent via extra-socket
-    // directive), then chown it so the sandbox user can connect.
-    wait_for_socket(&extra_socket_path)?;
+    // Wait for the main socket to appear.
+    let socket_path = gnupg_dir.join(SOCKET_NAME);
+    wait_for_socket(&socket_path)?;
 
-    // Chown everything in the sandbox gnupg dir (keyring files, trustdb,
-    // gpg.conf, and the extra socket) to the sandbox user.
-    chown_recursive(sandbox_gnupg_dir, sandbox_uid, sandbox_gid)?;
+    // Lock down private key material: private-keys-v1.d/ stays root-only.
+    let priv_keys_dir = gnupg_dir.join("private-keys-v1.d");
+    if priv_keys_dir.exists() {
+        std::fs::set_permissions(&priv_keys_dir, std::fs::Permissions::from_mode(0o700))
+            .into_diagnostic()?;
+    }
+
+    // Chown everything to the sandbox user EXCEPT private-keys-v1.d/.
+    chown_except_private_keys(gnupg_dir, sandbox_uid, sandbox_gid)?;
 
     // Write gitconfig if signing_key_id is set.
     if let Some(key_id) = signing_key_id.filter(|k| !k.is_empty()) {
         write_gitconfig_signing(key_id, sandbox_uid, sandbox_gid)?;
     }
 
-    // Read the agent PID from the socket directory.
-    let pid = read_agent_pid(private_dir)?;
+    // Read the agent PID.
+    let pid = read_agent_pid(gnupg_dir)?;
 
     info!(
         pid,
-        private_dir = %private_dir.display(),
-        sandbox_gnupg_dir = %sandbox_gnupg_dir.display(),
+        gnupg_dir = %gnupg_dir.display(),
         "GPG agent ready for signing"
     );
 
     Ok(GpgAgentHandle {
         pid,
-        private_dir: private_dir.to_path_buf(),
-        sandbox_gnupg_dir: sandbox_gnupg_dir.to_path_buf(),
+        gnupg_dir: gnupg_dir.to_path_buf(),
     })
 }
 
@@ -251,6 +254,57 @@ fn check_gpg_binaries() -> Result<PathBuf> {
     }
     debug!(path = %preset_path.display(), "Found gpg-preset-passphrase");
     Ok(preset_path)
+}
+
+/// Write a headless pinentry script and its passphrase file into a
+/// root-only directory.  Returns the path to the pinentry executable.
+///
+/// The pinentry speaks the Assuan pinentry protocol and returns the
+/// passphrase for every `GETPIN` request.  Because the agent runs as
+/// root the pinentry inherits root privileges and can read the
+/// passphrase file that the sandbox user cannot access.
+fn install_pinentry(passphrase: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Path::new(PINENTRY_DIR);
+    std::fs::create_dir_all(dir)
+        .into_diagnostic()
+        .wrap_err("failed to create pinentry directory")?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .into_diagnostic()?;
+
+    let pass_file = dir.join("passphrase");
+    std::fs::write(&pass_file, passphrase)
+        .into_diagnostic()
+        .wrap_err("failed to write passphrase file")?;
+    std::fs::set_permissions(&pass_file, std::fs::Permissions::from_mode(0o600))
+        .into_diagnostic()?;
+
+    let pinentry_path = dir.join("pinentry-openshell");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo 'OK Pleased to meet you'\n\
+         while IFS= read -r cmd; do\n\
+           case \"$cmd\" in\n\
+             GETPIN*)\n\
+               printf 'D %s\\n' \"$(cat {pass})\"\n\
+               echo OK ;;\n\
+             BYE*)\n\
+               echo OK; exit 0 ;;\n\
+             *)\n\
+               echo OK ;;\n\
+           esac\n\
+         done\n",
+        pass = pass_file.display()
+    );
+    std::fs::write(&pinentry_path, &script)
+        .into_diagnostic()
+        .wrap_err("failed to write pinentry script")?;
+    std::fs::set_permissions(&pinentry_path, std::fs::Permissions::from_mode(0o700))
+        .into_diagnostic()?;
+
+    debug!(path = %pinentry_path.display(), "Installed headless pinentry");
+    Ok(pinentry_path)
 }
 
 /// Extract all keygrips from the keyring. Keys with signing subkeys have
@@ -330,60 +384,6 @@ fn preset_passphrase(
     Ok(())
 }
 
-/// Export public keys from the private homedir and import them into the
-/// sandbox keyring so that the sandbox user's `gpg` recognises the key.
-fn export_public_key(private_dir: &Path, sandbox_dir: &Path) -> Result<()> {
-    use std::io::Write;
-
-    let export = Command::new("gpg")
-        .args([
-            "--homedir",
-            &private_dir.display().to_string(),
-            "--batch",
-            "--export",
-        ])
-        .output()
-        .into_diagnostic()
-        .wrap_err("failed to export public key")?;
-
-    if !export.status.success() {
-        let stderr = String::from_utf8_lossy(&export.stderr);
-        warn!(stderr = %stderr, "public key export produced warnings");
-    }
-
-    let mut child = Command::new("gpg")
-        .args([
-            "--homedir",
-            &sandbox_dir.display().to_string(),
-            "--batch",
-            "--import",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .into_diagnostic()
-        .wrap_err("failed to spawn gpg --import for sandbox keyring")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&export.stdout)
-            .into_diagnostic()
-            .wrap_err("failed to pipe public key to sandbox gpg")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .into_diagnostic()
-        .wrap_err("gpg --import into sandbox keyring failed")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(stderr = %stderr, "gpg --import into sandbox keyring produced warnings");
-    }
-    Ok(())
-}
-
 /// Write git signing configuration to the sandbox user's gitconfig.
 #[cfg(unix)]
 fn write_gitconfig_signing(
@@ -426,9 +426,14 @@ fn write_gitconfig_signing(
     Ok(())
 }
 
-/// Recursively chown a directory and all its contents.
+/// Chown all entries in the gnupg directory to the sandbox user,
+/// except `private-keys-v1.d/` which stays root-only.
 #[cfg(unix)]
-fn chown_recursive(dir: &Path, uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> Result<()> {
+fn chown_except_private_keys(
+    dir: &Path,
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+) -> Result<()> {
     use nix::unistd::chown;
 
     chown(dir, Some(uid), Some(gid))
@@ -438,11 +443,17 @@ fn chown_recursive(dir: &Path, uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> 
     for entry in std::fs::read_dir(dir).into_diagnostic()? {
         let entry = entry.into_diagnostic()?;
         let path = entry.path();
+        let name = entry.file_name();
+
+        if name == "private-keys-v1.d" {
+            continue;
+        }
+
         chown(&path, Some(uid), Some(gid))
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to chown {}", path.display()))?;
         if path.is_dir() {
-            chown_recursive(&path, uid, gid)?;
+            chown_except_private_keys(&path, uid, gid)?;
         }
     }
     Ok(())
@@ -457,15 +468,13 @@ fn wait_for_socket(path: &Path) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Err(miette::miette!(
-        "gpg-agent extra socket did not appear at {} within 5 s",
+        "gpg-agent socket did not appear at {} within 5 s",
         path.display()
     ))
 }
 
 /// Read the gpg-agent PID from the agent-info or pidfile.
 fn read_agent_pid(homedir: &Path) -> Result<u32> {
-    // gpg-agent writes a pidfile at $GNUPGHOME/S.gpg-agent when started
-    // with --daemon. We can also parse the output from gpg-connect-agent.
     let output = Command::new("gpg-connect-agent")
         .args([
             "--homedir",
@@ -499,19 +508,10 @@ mod tests {
     fn gpg_agent_handle_has_correct_paths() {
         let handle = GpgAgentHandle {
             pid: 12345,
-            private_dir: PathBuf::from(PRIVATE_DIR),
-            sandbox_gnupg_dir: PathBuf::from(SANDBOX_GNUPG_DIR),
+            gnupg_dir: PathBuf::from(SANDBOX_GNUPG_DIR),
         };
         assert_eq!(handle.gnupg_dir(), Path::new(SANDBOX_GNUPG_DIR));
         assert_eq!(handle.pid(), 12345);
-    }
-
-    #[test]
-    fn private_dir_constant_is_outside_sandbox() {
-        assert!(
-            !PRIVATE_DIR.starts_with("/sandbox"),
-            "private dir must not be under /sandbox"
-        );
     }
 
     #[test]
