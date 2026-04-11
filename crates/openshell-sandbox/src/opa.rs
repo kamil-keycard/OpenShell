@@ -2875,4 +2875,36 @@ process:
             "non-secret fields should still be present"
         );
     }
+
+    #[test]
+    fn opa_data_excludes_gpg_agent() {
+        use openshell_core::proto::GpgAgentConfig;
+
+        let mut proto = test_proto();
+        proto.gpg_agent = Some(GpgAgentConfig {
+            private_key_urn: "urn:secret-b64:gpg-private-key".to_string(),
+            passphrase_urn: "urn:secret:gpg-passphrase".to_string(),
+            signing_key_id: "ABCDEF1234567890".to_string(),
+        });
+
+        let json_str = proto_to_opa_data_json(&proto);
+        let data: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert!(
+            data.get("gpg_agent").is_none(),
+            "gpg_agent must not appear in OPA data"
+        );
+        assert!(
+            !json_str.contains("private_key_urn"),
+            "gpg_agent URNs must not leak into OPA data"
+        );
+        assert!(
+            !json_str.contains("passphrase_urn"),
+            "gpg_agent passphrase URN must not leak into OPA data"
+        );
+        assert!(
+            data.get("filesystem_policy").is_some(),
+            "non-secret fields should still be present"
+        );
+    }
 }
