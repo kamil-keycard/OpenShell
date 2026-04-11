@@ -302,7 +302,7 @@ fn preset_passphrase(
         .env("GNUPGHOME", homedir)
         .args(["--preset", keygrip])
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .into_diagnostic()
@@ -315,14 +315,16 @@ fn preset_passphrase(
             .wrap_err("failed to write passphrase to gpg-preset-passphrase")?;
     }
 
-    let status = child
-        .wait()
+    let output = child
+        .wait_with_output()
         .into_diagnostic()
         .wrap_err("gpg-preset-passphrase failed")?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "gpg-preset-passphrase exited with {status}"
+            "gpg-preset-passphrase exited with {}: {stderr}",
+            output.status
         ));
     }
     Ok(())
@@ -357,7 +359,7 @@ fn export_public_key(private_dir: &Path, sandbox_dir: &Path) -> Result<()> {
             "--import",
         ])
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .into_diagnostic()
@@ -370,13 +372,14 @@ fn export_public_key(private_dir: &Path, sandbox_dir: &Path) -> Result<()> {
             .wrap_err("failed to pipe public key to sandbox gpg")?;
     }
 
-    let status = child
-        .wait()
+    let output = child
+        .wait_with_output()
         .into_diagnostic()
         .wrap_err("gpg --import into sandbox keyring failed")?;
 
-    if !status.success() {
-        warn!("gpg --import into sandbox keyring exited with {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(stderr = %stderr, "gpg --import into sandbox keyring produced warnings");
     }
     Ok(())
 }
