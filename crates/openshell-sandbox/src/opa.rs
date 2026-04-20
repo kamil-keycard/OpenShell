@@ -807,6 +807,7 @@ mod tests {
             secret_mounts: vec![],
             secrets: None,
             gpg_agent: None,
+            host_mounts: vec![],
         }
     }
 
@@ -1647,6 +1648,7 @@ process:
             secret_mounts: vec![],
             secrets: None,
             gpg_agent: None,
+            host_mounts: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -2266,6 +2268,7 @@ process:
             secret_mounts: vec![],
             secrets: None,
             gpg_agent: None,
+            host_mounts: vec![],
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
@@ -2499,6 +2502,7 @@ network_policies:
             secret_mounts: vec![],
             secrets: None,
             gpg_agent: None,
+            host_mounts: vec![],
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();
         // Port 443

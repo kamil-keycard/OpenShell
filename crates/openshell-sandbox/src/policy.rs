@@ -180,3 +180,88 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::proto::{HostMount, SandboxPolicy as ProtoSandboxPolicy};
+
+    fn minimal_proto() -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            version: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn host_mount_rw_auto_adds_to_filesystem_read_write() {
+        let mut proto = minimal_proto();
+        proto.host_mounts.push(HostMount {
+            host_path: "/host-projects".into(),
+            mount_path: "/workspace".into(),
+            read_only: false,
+        });
+
+        let policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
+        assert!(
+            policy.filesystem.read_write.contains(&PathBuf::from("/workspace")),
+            "read-write mount should auto-add to filesystem.read_write"
+        );
+        assert!(
+            !policy.filesystem.read_only.contains(&PathBuf::from("/workspace")),
+            "read-write mount should NOT appear in filesystem.read_only"
+        );
+    }
+
+    #[test]
+    fn host_mount_ro_auto_adds_to_filesystem_read_only() {
+        let mut proto = minimal_proto();
+        proto.host_mounts.push(HostMount {
+            host_path: "/host-data".into(),
+            mount_path: "/data".into(),
+            read_only: true,
+        });
+
+        let policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
+        assert!(
+            policy.filesystem.read_only.contains(&PathBuf::from("/data")),
+            "read-only mount should auto-add to filesystem.read_only"
+        );
+        assert!(
+            !policy.filesystem.read_write.contains(&PathBuf::from("/data")),
+            "read-only mount should NOT appear in filesystem.read_write"
+        );
+    }
+
+    #[test]
+    fn host_mount_no_duplicates_in_filesystem() {
+        let mut proto = minimal_proto();
+        proto.host_mounts.push(HostMount {
+            host_path: "/host-projects".into(),
+            mount_path: "/workspace".into(),
+            read_only: false,
+        });
+        proto.host_mounts.push(HostMount {
+            host_path: "/host-projects-alt".into(),
+            mount_path: "/workspace".into(),
+            read_only: false,
+        });
+
+        let policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
+        let count = policy
+            .filesystem
+            .read_write
+            .iter()
+            .filter(|p| *p == &PathBuf::from("/workspace"))
+            .count();
+        assert_eq!(count, 1, "duplicate mount_paths should not create duplicate entries");
+    }
+
+    #[test]
+    fn no_host_mounts_leaves_filesystem_defaults() {
+        let proto = minimal_proto();
+        let policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
+        assert!(policy.filesystem.read_only.is_empty());
+        assert!(policy.filesystem.read_write.is_empty());
+    }
+}

@@ -111,6 +111,22 @@
 - Standalone `proxy_inference()` was removed; inference handled in-sandbox by openshell-router
 - Provider types: claude, codex, opencode, generic, openai, anthropic, nvidia, gitlab, github, outlook
 
+## GPG Agent Support
+- New module: `crates/openshell-sandbox/src/gpg_agent.rs` (agent lifecycle, `GpgAgentHandle`)
+- Policy YAML: `gpg_agent` block with `private_key_urn`, `passphrase_urn`, `signing_key_id`
+- Proto: `GpgAgentConfig` message in `proto/sandbox.proto` (field 8 on SandboxPolicy)
+- Serde: `GpgAgentDef` in `crates/openshell-policy/src/lib.rs`
+- Server: `extract_policy_secrets()` maps private_key_urn → file_secrets, passphrase_urn → env secrets
+- Well-known file secret path: `/var/lib/openshell/gpg/private-key.asc`
+- Internal env key: `__OPENSHELL_GPG_PASSPHRASE` (scrubbed before child exec)
+- Split dirs: `/run/openshell-gpg/private/` (root) + `/sandbox/.gnupg/` (sandbox user)
+- Static field: cannot change via UpdateSandboxPolicy
+- Excluded from OPA data
+- Included in deterministic policy hash (proto-encoded bytes)
+- Conflicts with `.gnupg` secret_mounts (validation rejects)
+- `child_env::gpg_agent_env_vars()` sets GNUPGHOME
+- Failure is non-fatal: warn + continue without signing support
+
 ## File Secret Mounts
 - Policy YAML: `secret_mounts` in the policy file (CLI --file-secret flag was removed)
 - Proto: `SandboxSpec.file_secrets` (map<string,string>, field 11 in datamodel.proto) + `SandboxPolicy.secret_mounts` (repeated SecretMount, field 6 in sandbox.proto)

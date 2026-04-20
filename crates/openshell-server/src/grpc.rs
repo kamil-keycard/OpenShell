@@ -7722,4 +7722,51 @@ mod tests {
         }
         // Either way, the WITH-lock test above asserts correctness.
     }
+
+    // ---- host mount prefix validation ----
+
+    #[test]
+    fn host_mount_prefixes_ok_when_no_mounts() {
+        let result = super::validate_host_mount_prefixes(&[], &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn host_mount_prefixes_rejects_mounts_without_exposed_dirs() {
+        let mounts = vec![openshell_core::proto::HostMount {
+            host_path: "/host-projects".into(),
+            mount_path: "/workspace".into(),
+            read_only: false,
+        }];
+        let result = super::validate_host_mount_prefixes(&mounts, &[]);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn host_mount_prefixes_accepts_matching_prefix() {
+        let mounts = vec![openshell_core::proto::HostMount {
+            host_path: "/host-projects/subdir".into(),
+            mount_path: "/workspace".into(),
+            read_only: false,
+        }];
+        let prefixes = vec!["/host-projects".to_string()];
+        let result = super::validate_host_mount_prefixes(&mounts, &prefixes);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn host_mount_prefixes_rejects_non_matching_prefix() {
+        let mounts = vec![openshell_core::proto::HostMount {
+            host_path: "/etc/passwd".into(),
+            mount_path: "/workspace".into(),
+            read_only: false,
+        }];
+        let prefixes = vec!["/host-projects".to_string()];
+        let result = super::validate_host_mount_prefixes(&mounts, &prefixes);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
 }

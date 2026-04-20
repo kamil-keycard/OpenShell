@@ -1934,4 +1934,103 @@ gpg_agent:
 "#;
         assert!(parse_sandbox_policy(yaml).is_err());
     }
+
+    #[test]
+    fn round_trip_host_mounts() {
+        let yaml = r#"
+version: 1
+host_mounts:
+  - host_path: "/host-projects"
+    mount_path: "/workspace"
+    read_only: false
+  - host_path: "/host-data"
+    mount_path: "/data"
+    read_only: true
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        assert_eq!(proto.host_mounts.len(), 2);
+        assert_eq!(proto.host_mounts[0].host_path, "/host-projects");
+        assert_eq!(proto.host_mounts[0].mount_path, "/workspace");
+        assert!(!proto.host_mounts[0].read_only);
+        assert_eq!(proto.host_mounts[1].host_path, "/host-data");
+        assert_eq!(proto.host_mounts[1].mount_path, "/data");
+        assert!(proto.host_mounts[1].read_only);
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto2.host_mounts.len(), 2);
+        assert_eq!(proto2.host_mounts[0].host_path, "/host-projects");
+        assert_eq!(proto2.host_mounts[1].read_only, true);
+    }
+
+    #[test]
+    fn host_mounts_default_read_only_is_false() {
+        let yaml = r#"
+version: 1
+host_mounts:
+  - host_path: "/host-projects"
+    mount_path: "/workspace"
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        assert_eq!(proto.host_mounts.len(), 1);
+        assert!(!proto.host_mounts[0].read_only);
+    }
+
+    #[test]
+    fn host_mounts_absent_parses_fine() {
+        let yaml = "version: 1\n";
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        assert!(proto.host_mounts.is_empty());
+    }
+
+    #[test]
+    fn host_mounts_rejects_relative_paths() {
+        let yaml = r#"
+version: 1
+host_mounts:
+  - host_path: "relative/path"
+    mount_path: "/workspace"
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        let err = validate_sandbox_policy(&proto).expect_err("expected validation failure");
+        assert!(
+            err.iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidHostMount { .. })),
+            "expected InvalidHostMount violation, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn host_mounts_rejects_path_traversal() {
+        let yaml = r#"
+version: 1
+host_mounts:
+  - host_path: "/host-projects/../etc"
+    mount_path: "/workspace"
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        let err = validate_sandbox_policy(&proto).expect_err("expected validation failure");
+        assert!(
+            err.iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidHostMount { .. })),
+            "expected InvalidHostMount violation for path traversal, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn host_mounts_rejects_empty_paths() {
+        let yaml = r#"
+version: 1
+host_mounts:
+  - host_path: ""
+    mount_path: "/workspace"
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse should succeed");
+        let err = validate_sandbox_policy(&proto).expect_err("expected validation failure");
+        assert!(
+            err.iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidHostMount { .. })),
+            "expected InvalidHostMount violation for empty path, got: {err:?}"
+        );
+    }
 }

@@ -2235,4 +2235,67 @@ mod tests {
             "workspace mount must NOT be present when inject_workspace is false"
         );
     }
+
+    #[test]
+    fn apply_host_mounts_injects_volumes_and_mounts() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "test:latest"
+                }],
+                "volumes": []
+            }
+        });
+
+        let mounts = vec![
+            openshell_core::proto::HostMount {
+                host_path: "/host-projects".into(),
+                mount_path: "/workspace".into(),
+                read_only: false,
+            },
+            openshell_core::proto::HostMount {
+                host_path: "/host-data".into(),
+                mount_path: "/data".into(),
+                read_only: true,
+            },
+        ];
+
+        apply_host_mounts(&mut pod_template, &mounts);
+
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(volumes.len(), 2);
+        assert_eq!(volumes[0]["name"], "host-mount-0");
+        assert_eq!(volumes[0]["hostPath"]["path"], "/host-projects");
+        assert_eq!(volumes[0]["hostPath"]["type"], "Directory");
+        assert_eq!(volumes[1]["name"], "host-mount-1");
+        assert_eq!(volumes[1]["hostPath"]["path"], "/host-data");
+
+        let vm = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(vm.len(), 2);
+        assert_eq!(vm[0]["name"], "host-mount-0");
+        assert_eq!(vm[0]["mountPath"], "/workspace");
+        assert_eq!(vm[0]["readOnly"], false);
+        assert_eq!(vm[1]["name"], "host-mount-1");
+        assert_eq!(vm[1]["mountPath"], "/data");
+        assert_eq!(vm[1]["readOnly"], true);
+    }
+
+    #[test]
+    fn apply_host_mounts_noop_when_empty() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "test:latest"
+                }],
+                "volumes": []
+            }
+        });
+        let original = pod_template.clone();
+        apply_host_mounts(&mut pod_template, &[]);
+        assert_eq!(pod_template, original);
+    }
 }

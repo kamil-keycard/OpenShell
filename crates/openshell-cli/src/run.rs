@@ -5141,6 +5141,7 @@ mod tests {
             auth_mode: Some("cloudflare_jwt".to_string()),
             edge_team_domain: None,
             edge_auth_url: None,
+            exposed_dirs: vec![],
         }
     }
 
@@ -5573,6 +5574,7 @@ mod tests {
                 auth_mode: None,
                 edge_team_domain: None,
                 edge_auth_url: None,
+                exposed_dirs: vec![],
             },
         ];
 
